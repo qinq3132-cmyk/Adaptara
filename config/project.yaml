@@ -1,0 +1,14 @@
+question:
+  id: Q001
+  text: What computational principles enable an artificial agent to autonomously and continually adapt to unknown environmental changes without externally supplied sample-level teaching signals, explicit task identities, or manually triggered learning?
+  constraints:
+    - dynamic environment
+    - autonomous adaptation
+    - continual adaptation
+    - no sample-level labels
+    - no explicit task ID
+    - no manual adaptation trigger
+budget:
+  max_rounds: 1
+  max_compute_units: 1000
+  max_retries: 0

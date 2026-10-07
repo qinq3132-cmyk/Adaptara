@@ -1,0 +1,2 @@
+# Reserved provider configuration. No model or API is used in Milestone 1.
+mode: deterministic_mock

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autonomous-scientist"
+version = "0.1.0"
+description = "Milestone 1: a traceable deterministic scientific cycle"
+requires-python = ">=3.12"
+dependencies = ["pydantic>=2.10,<3", "PyYAML>=6,<7"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[tool.setuptools.packages.find]
+include = ["scientist*", "experiments*", "environments*", "algorithms*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
