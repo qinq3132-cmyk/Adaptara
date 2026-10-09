@@ -14,6 +14,7 @@ def capture_source(root: Path) -> dict[str, str]:
     for folder in ("scientist", "experiments", "algorithms", "environments"):
         paths.extend((root / folder).rglob("*.py"))
     paths.extend((root / "config").glob("*.yaml"))
+    paths.extend((root / "scientist/prompts").glob("*.txt"))
     return {path.relative_to(root).as_posix(): path.read_text(encoding="utf-8")
             for path in sorted(set(paths)) if path.is_file()}
 

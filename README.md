@@ -1,8 +1,12 @@
-# Autonomous Scientist — Milestone 1
+# Autonomous Scientist
 
-One offline scientific cycle, with deterministic mock reasoning and an executable
-arithmetic counterexample. No API key, model download, literature search, real
-benchmark, autonomous multi-round scheduler, or hardware integration is required.
+The default demo runs one offline scientific cycle, with deterministic mock
+reasoning and an executable arithmetic counterexample. An explicit hypothesis
+generation mode calls Codex (or OpenCode) with a configured model provider, and a
+bounded local document reader uses Codex file tools. The offline demo needs no
+API key or model download; reasoning modes reuse existing OpenCode credentials.
+Literature retrieval, real benchmarks, an autonomous multi-round scheduler and
+hardware integration remain future work.
 
 ## Run
 
@@ -18,7 +22,8 @@ python -m pytest -q
 `python run_scientist.py` also runs the demo. Paths default to the project directory,
 independent of your working directory. Override with `--output-dir`, `--database`,
 and `--config-dir`. The latter must contain `project.yaml` and `experiments.yaml`.
-`models.yaml` is reserved documentation; no provider is loaded.
+`models.yaml` configures the explicit `--generate-hypotheses` mode;
+the default demo does not load a provider.
 
 Each invocation creates a distinct `artifacts/run_<uuid>/` and adds one SQLite run
 to `database/research.sqlite3`. Repeated IDs such as H001 are scoped to their run
@@ -45,7 +50,8 @@ Required exports: `question.json`, `hypotheses.json`, `experiment_plan.json`,
 `research_state.json`. Additional exports include `experiment.json`,
 `source_snapshot.json`, `runtime.json`, and a checksum `manifest.json`.
 `hypotheses.json` contains initial proposals; final beliefs are in `research_state.json`.
-E002 is proposed and saved but **never executed** in this milestone.
+The default E001 demo proposes and saves E002 without executing it. The explicit
+`--followup E002` command below executes the saved follow-up in a new run.
 
 ## What the toy demonstrates
 
@@ -102,7 +108,7 @@ in `environments/base.py` and `algorithms/base.py`; they are not implemented her
 
 Use `build_demo()` as the composition-root example. Adding new adapters changes
 composition, not `ScientificState` or `Orchestrator.run_cycle(state) -> ScientificState`.
-Milestone 1 only accepts a fresh cycle. Multi-round scheduling and resume semantics
+The default Milestone 1 orchestrator only accepts a fresh cycle. Multi-round scheduling and resume semantics
 remain deferred; loading a completed state is supported for inspection and replay.
 Any future incompatible persisted schema requires an explicit version migration.
 
@@ -156,8 +162,136 @@ the configured bound; execution is never automatically retried. Real runners wil
 need process isolation, wall-time limits, and enforcement of actual resource budgets.
 These are not claimed by the current accounting checks.
 
-The full requested specification is preserved in `SPEC.md`. Only its Milestone 1
-is implemented. Future literature, prompts, tools, real environments, baselines,
+The full requested specification is preserved in `SPEC.md`. Its Milestone 1 and the explicit E002 follow-up described below
+are implemented, along with model-authored hypothesis generation through Codex/OpenCode
+and local text/Markdown document reading. Future literature retrieval, real environments, baselines,
 generated code execution, adaptive experiment selection across rounds, and hardware
 work remain deferred. Reserved directories contain notes rather than executable
 stubs that could be mistaken for working later-phase functionality.
+
+## Execute the E002 follow-up
+
+After a saved E001 demo, run:
+
+```bash
+python run_scientist.py --followup E002
+# Or select a particular parent run:
+python run_scientist.py --followup E002 --parent-run run_<uuid>
+```
+
+The default parent is the latest completed E001 with a proposed E002. The command
+verifies the parent's checksums and SQLite state before execution. Copied projects
+with stale Windows artifact paths are supported through the matching local
+`artifacts/run_<uuid>` directory, without modifying the parent DB row.
+
+E002 refines the parent proposal into six executable arms: frozen, positive
+residual action updates, declared relevance filtering, predictor-state adaptation,
+alternating-direction matched-update control, and reversed-direction control.
+The parent's environment and seeds are preserved. The refined plan, original
+proposal, parent state, parent source snapshot and reason for refinement are saved.
+The new state retains E001 history, extends the round limit to two for this explicit
+follow-up, and accumulates E002 costs. This is not a general multi-round scheduler.
+
+All arms see identical sensor trajectories. Positive, negative, alternating and
+predictor-state arms use the same observation-only fixed-zero residual gate;
+the predictor state is distinct from that gate. Those four arms match update event
+counts, not FLOPs or operation cost. Relevance-filter and frozen arms make zero
+updates. Relevance is declared by the tracking objective, not discovered online.
+No hidden shift metadata, evaluator target or evaluator loss reaches the algorithms.
+
+The result records per-arm action loss, action-parameter updates, predictor-state
+updates and nuisance prediction errors, with separate per-seed exports. Raw data
+is saved before analysis. H002/H003 receive weak, fixture-specific supporting
+evidence only if their measured predictions hold during an active trigger; their
+existing internal belief scores are retained. H001 retains its earlier status.
+There is no statistical significance or general adaptation claim.
+
+Each follow-up saves the standard artifacts plus `lineage.json`,
+`parent_state.json`, `parent_source_snapshot.json`, `results_by_seed.json`, and
+`report.md`; the report is covered by the checksum manifest. Checksums and exact
+runner replay are verified. Reported compute units count experimental arm-steps;
+verification replay performs the same work again and is outside the experiment's
+reported budget. No failed experiment is automatically retried.
+
+```python
+from experiments.followup_runner import FollowupExperimentRunner
+
+state = store.load("run_<followup_uuid>")
+result = next(r for r in state.results if r.experiment_id == "E002")
+plan = next(e for e in state.experiments if e.id == "E002")
+assert FollowupExperimentRunner().execute(plan, result.provenance) == result
+```
+
+## Generate hypotheses through Codex or OpenCode
+
+Scientific roles and execution runtimes are separate: one Hypothesis Agent
+proposes 3-6 competing hypotheses; Codex or OpenCode runs that role using the selected
+provider/model configuration. Each hypothesis is a scientific record, not a
+separate coding-agent process. Literature, planning and critique roles remain
+future work.
+
+```bash
+python run_scientist.py --generate-hypotheses
+python run_scientist.py --check-backend
+python run_scientist.py --read-document examples/document_reading_smoke.md
+# Use the original OpenCode runtime:
+python run_scientist.py --generate-hypotheses --backend opencode --model Lemon-Domestic/glm-5.3
+# Select another model already configured in OpenCode:
+python run_scientist.py --generate-hypotheses --backend opencode --model Paratera/Qwen3.8-Max
+# Use previous recorded research as context:
+python run_scientist.py --generate-hypotheses --state-file artifacts/run_<uuid>/research_state.json
+```
+
+`config/models.yaml` contains only nonsecret execution settings. This project
+now uses Codex with `glm-5.3-flash` at the supplied gateway, reusing the same
+API key from OpenCode's `Lemon-Domestic` provider in its child process only.
+It does not change global Codex config/auth or the existing ChatGPT login.
+The verified standalone Codex 0.150.1 and its read-only Landlock sandbox are
+selected in `config/models.yaml`; the IDE Codex has a namespace restriction here.
+See [Codex setup, isolation and diagnostics](docs/codex_backend.md).
+
+For the OpenCode backend, override the executable with `--opencode-bin` or
+`SCIENTIST_OPENCODE_BIN`, and the configuration path with `--opencode-config`.
+No OpenCode config or credential values are copied into project artifacts.
+The adapter calls the installed `opencode run --pure --format json --agent
+hypothesis --model <provider/model>` in a fresh temporary working directory.
+The role uses a two-step ceiling to avoid the one-step assistant-summary prefill
+that this compatible model rejects. The supplied role has no tool permissions; hypothesis generation needs only the
+provided question, claims and recorded research. Literature roles can later use
+a separate configuration for reading and retrieval tools.
+
+The model supplies claims, mechanisms, assumptions, predictions, alternatives
+and falsification conditions. Python assigns globally noncolliding H IDs,
+initializes `proposed` status and internal belief score 0.5, and validates fields,
+count, exact duplicate claims/mechanisms and references to existing claims or
+parent hypotheses. Semantic independence and scientific usefulness still require
+critique and evaluation. Hypotheses may propose mechanisms not yet executable.
+
+This command saves only hypotheses and scientific context; it never invokes the
+fixed E001 planner or executes an experiment. New proposals are appended to an
+input state rather than replacing its history. `current_round` and experimental
+compute spend do not advance; stage becomes `HYPOTHESIS`. A new SQLite run and
+verified artifacts include `input_state.json`, `hypotheses.json`,
+`research_state.json`, `reasoning.json`, `source_snapshot.json`, `runtime.json`,
+and `report.md`. The reasoning trace includes prompts, output text, requested
+model, session ID, reported tokens/cost and validation attempts. Model inference
+is not claimed to be exactly reproducible; the saved output can be revalidated.
+
+Malformed proposals may be regenerated within the configured validation bound.
+Runtime/provider failures stop without committing research or falling back to
+mock hypotheses. The subprocess timeout bounds each invocation; reported model
+usage is recorded separately from toy experiment compute units. OpenCode may
+perform its own provider retries within that timeout. A fixed session title
+avoids an extra model call for automatic title generation.
+
+The current environment has a working uppercase proxy configuration and stale
+lowercase proxy variables. `proxy_env_precedence: uppercase` normalizes these
+variables only for the runtime child process. Set it to `inherit` to preserve
+another environment unchanged; global proxy settings are never modified.
+
+OpenCode's role/model/JSON-event interface is documented in its official
+[CLI documentation](https://opencode.ai/docs/cli/) and
+[agent configuration](https://opencode.ai/docs/agents/).
+The Codex adapter maps OpenCode credentials into an invocation-scoped custom
+provider, with Responses streaming, structured output and file-tool checks.
+See the official [OpenAI Docs on custom providers](https://learn.chatgpt.com/docs/config-file/config-advanced#custom-model-providers).

@@ -15,6 +15,9 @@ test = ["pytest>=8,<10"]
 [tool.setuptools.packages.find]
 include = ["scientist*", "experiments*", "environments*", "algorithms*"]
 
+[tool.setuptools.package-data]
+scientist = ["prompts/*.txt"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

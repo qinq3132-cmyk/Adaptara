@@ -1,2 +1,26 @@
-# Reserved provider configuration. No model or API is used in Milestone 1.
-mode: deterministic_mock
+# Nonsecret execution settings. --demo and --followup remain offline.
+backend: codex
+model: glm-5.3-flash
+# Existing OpenCode runtime/config, used only with that backend or auth bridge.
+executable: null
+config: null
+# Current environment has working uppercase proxies and stale lowercase ones.
+# Normalize only the child process; set inherit to keep the environment verbatim.
+proxy_env_precedence: uppercase
+timeout_seconds: 180
+hypothesis_count: 3
+validation_retries: 1
+# This already-installed standalone version passed the local Landlock/read test.
+# The IDE's 0.162 alpha needs bubblewrap even in legacy mode in this container.
+# Override with --codex-bin or change this path on another machine.
+codex_executable: /opt/conda/envs/si/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex
+codex_sandbox_backend: landlock
+# Read the SAME API key from OpenCode only for the AI Scientist child process.
+# Never modify the global Codex auth.json / ChatGPT login.
+codex_auth_mode: opencode
+codex_credential_provider: Lemon-Domestic
+codex_provider_id: OpenAI
+codex_base_url: http://39.105.190.188:3456/v1
+codex_model_catalog: null
+codex_reasoning_effort: high
+codex_reasoning_summary: auto

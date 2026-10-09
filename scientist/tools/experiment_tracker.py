@@ -1,4 +1,4 @@
-"""SQLite is the authoritative commit; JSON files are verified exports."""
+"""SQLite is the authoritative commit; artifact files are verified exports."""
 import hashlib
 import json
 import sqlite3
@@ -56,7 +56,7 @@ class ResearchStore:
         for name, value in exports.items():
             if Path(name).name != name:
                 raise ValueError("Artifact names must be plain filenames")
-            payload = json_bytes(value)
+            payload = value if isinstance(value, bytes) else json_bytes(value)
             (directory / name).write_bytes(payload)
             checksums[name] = hashlib.sha256(payload).hexdigest()
         (directory / "manifest.json").write_bytes(json_bytes({"schema_version": 1, "run_id": run_id, "sha256": checksums}))
