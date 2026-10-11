@@ -6,12 +6,15 @@ from pydantic import Field, StrictBool, model_validator
 from .problem_schemas import ProblemText
 from .schemas import Record, Text
 
+LiteratureProvider = Literal["semantic_scholar", "arxiv", "crossref", "europe_pmc", "openalex"]
+
 
 class SearchQuery(Record):
     text: ProblemText = Field(max_length=200)
     purpose: Literal["overview", "support", "challenge", "cross_discipline"]
     discipline: ProblemText
     rationale: ProblemText
+    providers: tuple[LiteratureProvider, ...] = ()
 
 
 class SearchPlan(Record):
@@ -27,8 +30,11 @@ class PaperCandidate(Record):
     year: int | None = None
     doi: str | None = None
     arxiv_id: str | None = None
+    pmid: str | None = None
+    pmcid: str | None = None
     source_uri: ProblemText
     fulltext_uri: str | None = None
+    fulltext_uris: tuple[str, ...] = ()
     providers: tuple[str, ...] = ()
     query_texts: tuple[str, ...] = ()
 
@@ -53,7 +59,7 @@ class DocumentSection(Record):
 class PaperDocument(Record):
     paper_id: ProblemText
     source_uri: ProblemText
-    read_level: Literal["abstract", "excerpt", "full_text"]
+    read_level: Literal["title", "abstract", "excerpt", "full_text"]
     sections: tuple[DocumentSection, ...] = Field(min_length=1)
     content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     fetched_at: ProblemText

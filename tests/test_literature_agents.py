@@ -561,6 +561,33 @@ def test_fulltext_failure_abstract_fallback_is_explicit():
     with pytest.raises(RuntimeError): tools.fetch_document(paper, allow_abstract=False)
 
 
+def test_title_only_paper_is_retained_without_reading_or_evidence(setup):
+    _, pipeline, factory = setup
+    pipeline.config = pipeline.config.model_copy(update={'max_selected_papers': 2})
+    original = pipeline.tools.fetch_document
+    def fetch(candidate, **kwargs):
+        if candidate.id != 'P_other':
+            return original(candidate, **kwargs)
+        sections = (DocumentSection(id='S001', heading='Title', text=candidate.title),)
+        return PaperDocument(paper_id=candidate.id, source_uri=candidate.source_uri, read_level='title',
+            sections=sections, content_sha256=digest([s.model_dump(mode='json') for s in sections]),
+            fetched_at='not_recorded', limitations=('Only title available',))
+    pipeline.tools.fetch_document = fetch
+    def mutate(role, data, inputs):
+        if role == 'literature_screening':
+            for decision in data['decisions']:
+                decision['selected'] = True
+    factory.mutate = mutate
+    state = run_literature(setup)
+    assert [p.read_level for p in state.papers] == ['full_text', 'title']
+    assert len(state.evidence) == 1 and state.evidence[0].source_id == 'P_test'
+    assert [role for role, _ in factory.calls].count('literature_reading') == 1
+    assert pipeline.exports['retrieval_summary.json']['read_levels']['title'] == 1
+    title_evidence = state.evidence[0].model_copy(update={'source_id': 'P_other', 'content_sha256': state.papers[1].content_sha256})
+    with pytest.raises(ValueError, match='Title-only'):
+        state.revised(evidence=(title_evidence,))
+
+
 def test_pdf_page_location():
     pypdf = pytest.importorskip("pypdf")
     from pypdf.generic import DictionaryObject, NameObject, DecodedStreamObject

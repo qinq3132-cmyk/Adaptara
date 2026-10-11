@@ -6,7 +6,7 @@
 flowchart TD
     A[已确认研究定义] --> B[检索规划 Agent]
     B -->|检索式| C[Python 学术检索与正文获取]
-    S[(Semantic Scholar / arXiv / Crossref)] --> C
+    S[(Semantic Scholar / arXiv / Crossref / Europe PMC / OpenAlex)] --> C
     C -->|论文列表| D[筛选 Agent]
     D -->|入选论文| E[阅读 Agent]
     D -->|数量或覆盖不足：反馈重写查询| B
@@ -24,7 +24,7 @@ flowchart TD
 
 | 角色 | 输入 | 输出 | 程序校验 |
 |---|---|---|---|
-| `literature_search` | 完整确认定义、查询预算、历轮返回量与筛选反馈 | `SearchPlan` | 每轮数量、查询去重、修复轮数 |
+| `literature_search` | 完整确认定义、查询预算、可用来源与学科说明、历轮返回量与筛选反馈 | `SearchPlan`（每条查询可指定来源） | 每轮数量、查询去重、来源必须已配置、修复轮数 |
 | `literature_screening` | 候选论文、确认定义 | `PaperSelection` | 每篇恰好一次、入选数量 |
 | `literature_reading` | 原文或明确标记的摘录/摘要 | `PaperReading` | 引用章节存在、逐字连续引用、摘要/摘录强度 |
 | `evidence_verification` | 原始材料和逐条提取 | `EvidenceChecks` | 每条发现恰好一次；仅 accepted 入库 |
@@ -48,7 +48,8 @@ flowchart TD
 
 accepted 表示核查 Agent 判断提取忠实于当前材料，不代表论文结论被独立验证。
 PDF 按页定位；HTML 按章节和段落编号定位。过长正文明确标记 excerpt，只读开头与末尾；
-正文不可用且配置允许时降级为 abstract，明确记录原因并限制证据强度。
+正文不可用且配置允许时降级为 abstract，明确记录原因并限制证据强度。摘要也缺失时保存 title，
+仅供相关性判断，不调用阅读/证据核查 Agent，也不能生成 verified 科研证据；其余论文继续处理。
 原文快照随 SQLite-authoritative run 导出，引用必须匹配快照内容和校验和。
 审查重新加载原始数据库中经过验证的快照，不仅阅读二手摘要。
 审查调用将共同条件下的预测映射编译为本轮候选 ID 的固定字段，满足
@@ -62,6 +63,9 @@ PDF 按页定位；HTML 按章节和段落编号定位。过长正文明确标�
 可以逐角色配置 `model`、`auth_mode`、`reasoning_effort`、`timeout_seconds`。
 每次运行的实际模型配置和检索/修订预算保存为 `pipeline_configuration.json`，包括自定义配置。
 Semantic Scholar 可选密钥从 `SEMANTIC_SCHOLAR_API_KEY` 环境变量读取，只放入 HTTP 头，不导出。
+OpenAlex 可选密钥从 `OPENALEX_API_KEY` 读取，只放入 Authorization 头；匿名额度耗尽或访问受限会记录失败并继续其他源。
+Unpaywall 通过 `UNPAYWALL_EMAIL` 配置真实联系邮箱；未配置时明确记录跳过，不使用虚构邮箱。
+`resolve_open_access` 控制已入选论文的开放版本查找，默认启用；`allow_abstract` 允许摘要及仅标题降级。
 
 PDF 支持安装：`pip install -e '.[literature]'`。没有 PDF 解析依赖时仍可阅读 HTML；摘要降级遵循配置。
 
@@ -72,11 +76,23 @@ PDF 支持安装：`pip install -e '.[literature]'`。没有 PDF 解析依赖时
 原始的单论文实跑使用了专门的 1 查询/1 阅读配置，不能据此判断整个领域只有一篇论文。
 
 零结果或筛选不足时，GLM 接收真实检索事件、已用查询、拒绝原因，改写通行术语、拆分概念或换检索入口。
-Semantic Scholar / arXiv / [Crossref](https://www.crossref.org/documentation/retrieve-metadata/rest-api/)
+Semantic Scholar / arXiv / [Crossref](https://www.crossref.org/documentation/retrieve-metadata/rest-api/) /
+[Europe PMC](https://europepmc.org/RestfulWebService) / [OpenAlex](https://help.openalex.org/api/)
 之间保留独立检索结果；遇到 429/403 的源本轮暂停，其余源继续。候选按查询和来源交替分配预算，并按标题、DOI、arXiv ID 合并。
 筛选判断是否值得阅读，直接工作、机制参考和不同设定的反例都可入选；不会为了数量目标选无关文章。
+GLM 按学科为每条查询选择 `providers`；空数组表示使用全部配置来源。Europe PMC 的 core 响应提供
+PubMed/PMC 标识、摘要及开放全文链接；OpenAlex 提供跨学科元数据、重建的摘要和多个开放版本位置。
+检索不使用开放获取过滤，不因论文无法下载就排除候选。按 DOI、PMID、PMCID、arXiv ID 和标题去重，合并可用下载位置。
+
+已入选论文先尝试已知全文位置（PMC XML、arXiv HTML/PDF、元数据中提供的地址），失败后通过
+[Unpaywall](https://unpaywall.org/data-format) 查找开放版本，并按 DOI 查询 Europe PMC 补充 PMC 路径。
+一个位置失败仍尝试其他位置；XML 必须包含可用 body，HTML 必须识别正文科学章节，摘要落地页不标为全文。
+下载和版本解析事件写入 `retrieval.json`；Unpaywall 返回的版本随成功来源记录并传入阅读限制。
+网络请求按主机顺序限速并缓存，429/暂时性服务错误指数退避；遵守秒数或 HTTP 日期格式的 Retry-After。
+等待超过 30 秒预算时结束当前请求并保留 429 主机冷却状态，其余来源继续。
 
 `search_history.json` 保存历轮计划、返回量与筛选；`retrieval_summary.json` 区分候选、入选、阅读和有 accepted 证据的论文。
+同时统计 `full_text`、`excerpt`、`abstract`、`title` 四种材料范围，不把标题或摘要计为全文。
 预算耗尽或正文/核查不足时报告 `partial`，不把限流或获取失败写成“相关文献不存在”。
 
 ## 运行

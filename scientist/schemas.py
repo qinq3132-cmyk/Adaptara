@@ -42,7 +42,7 @@ class Paper(Record):
     arxiv_id: str | None = None
     version: str | None = None
     content_sha256: str | None = None
-    read_level: Literal["abstract", "excerpt", "full_text"] | None = None
+    read_level: Literal["title", "abstract", "excerpt", "full_text"] | None = None
 
     @model_serializer(mode="wrap")
     def serialize_optional(self, handler):

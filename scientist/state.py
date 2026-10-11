@@ -96,6 +96,8 @@ class ScientificState(Record):
                 paper = next(p for p in self.papers if p.id == evidence.source_id)
                 if paper.content_sha256 != evidence.content_sha256 or paper.read_level is None:
                     raise ValueError("Literature evidence differs from its paper snapshot")
+                if paper.read_level == "title":
+                    raise ValueError("Title-only papers cannot support verified scientific evidence")
         if self.literature is not None:
             for item in self.literature.gaps + self.literature.conflicts:
                 require(item.evidence_ids, self.evidence, "literature observations")

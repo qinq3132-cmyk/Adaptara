@@ -8,7 +8,7 @@ from pydantic import Field, model_validator
 from .agents.literature import (LiteratureSearchAgent, LiteratureScreeningAgent, LiteratureReadingAgent,
                                EvidenceVerificationAgent, LiteratureSynthesisAgent)
 from .hypothesis_generation import ReasoningConfig, make_reasoning_backend
-from .literature_schemas import LiteratureOverview, SearchQuery
+from .literature_schemas import LiteratureOverview, LiteratureProvider, SearchQuery
 from .provenance import capture_source, runtime_versions
 from .schemas import Claim, Evidence, Paper, Record
 from .state import ScientificState
@@ -37,7 +37,7 @@ class AgentSettings(Record):
 
 
 class LiteratureConfig(Record):
-    providers: tuple[Literal["semantic_scholar", "arxiv", "crossref"], ...] = ("semantic_scholar", "arxiv")
+    providers: tuple[LiteratureProvider, ...] = ("semantic_scholar", "arxiv", "crossref", "europe_pmc", "openalex")
     max_queries: int = Field(default=3, ge=1, le=6)
     results_per_query: int = Field(default=5, ge=1, le=10)
     max_candidates: int = Field(default=15, ge=1, le=50)
@@ -47,6 +47,7 @@ class LiteratureConfig(Record):
     max_search_rounds: int = Field(default=1, ge=1, le=4)
     max_characters_per_paper: int = Field(default=36000, ge=1000, le=100000)
     allow_abstract: bool = True
+    resolve_open_access: bool = True
     http_timeout_seconds: float = Field(default=25, gt=0, le=60)
     max_revision_rounds: int = Field(default=1, ge=0, le=3)
     max_supplement_rounds: int = Field(default=1, ge=0, le=2)
@@ -71,7 +72,8 @@ class LiteraturePipeline:
         self.common, self.config, self.artifact_root = common, config, Path(artifact_root)
         self.backend_factory, self.emit = backend_factory, emit
         self.tools = tools or LiteratureTools(LiteratureHTTP(self.artifact_root / "literature_http_cache",
-                                                            timeout=config.http_timeout_seconds))
+                                                            timeout=config.http_timeout_seconds),
+                                             resolve_open_access=config.resolve_open_access)
         self.attempts, self.exports = [], {}
 
     def agent(self, cls):
@@ -111,14 +113,26 @@ class LiteraturePipeline:
                     raise ValueError("Search queries must be distinct")
                 if any(normalize(q.text).casefold() in forbidden_queries for q in plan.queries):
                     raise ValueError("Recovery queries must differ from already executed queries")
+                for query in plan.queries:
+                    if set(query.providers) - set(self.config.providers) or len(query.providers) != len(set(query.providers)):
+                        raise ValueError("Query must choose distinct configured providers")
             if round_number == 0 and queries is not None:
                 if not queries or len(queries) > self.config.max_queries:
                     raise ValueError("Supplementary queries exceed search budget")
+                for query in queries:
+                    if set(query.providers) - set(self.config.providers) or len(query.providers) != len(set(query.providers)):
+                        raise ValueError("Supplementary query must choose distinct configured providers")
                 plan_data = {"queries": [q.model_dump(mode="json") for q in queries], "origin": "hypothesis_review"}
                 round_queries = queries
             else:
                 plan = self.call(LiteratureSearchAgent, {"research_definition": definition,
                          "max_queries": self.config.max_queries, "phase": "initial" if round_number == 0 else "recovery",
+                         "available_providers": list(self.config.providers),
+                         "provider_guidance": {"europe_pmc": "生命科学、神经科学、生物医学；包含 PubMed 和 PMC",
+                                               "openalex": "跨学科论文、开放版本链接",
+                                               "semantic_scholar": "跨学科学术索引", "crossref": "跨学科 DOI 元数据",
+                                               "arxiv": "预印本，含计算机科学、数学、物理等"},
+                         "acquisition_policy": "优先获取全文；不可用时依据标题和摘要判断相关性，不因全文不可用排除论文",
                          "coverage_targets": {"min_candidates": self.config.min_candidates,
                                               "min_selected_papers": self.config.min_selected_papers},
                          "previous_queries": [q.model_dump(mode="json") for q in used_queries],
@@ -190,6 +204,14 @@ class LiteraturePipeline:
                 limitations.append(f"{candidate.id} 未能取得可读材料：{error}")
                 continue
             self.exports[f"document_{candidate.id}.json"] = document.model_dump(mode="json")
+            if document.read_level == "title":
+                new_papers.append(Paper(id=candidate.id, title=candidate.title, source_uri=document.source_uri,
+                                        doi=candidate.doi, arxiv_id=candidate.arxiv_id,
+                                        content_sha256=document.content_sha256, read_level="title"))
+                limitations.extend(document.limitations)
+                extraction_audit.append({"paper_id": candidate.id, "reading": None, "checks": [],
+                                         "reason": "仅标题用于相关性判断，不提取科研证据"})
+                continue
             sections = {s.id: s for s in document.sections}
             def check_reading(reading):
                 for finding in reading.findings:
@@ -235,7 +257,9 @@ class LiteraturePipeline:
         self.exports["retrieval.json"] = self.tools.events
         summary = self.exports["retrieval_summary.json"]
         summary.update(documents_read=len(new_papers), papers_with_accepted_evidence=len({e.source_id for e in new_evidence}),
-                       accepted_findings=len(new_evidence))
+                       accepted_findings=len(new_evidence),
+                       read_levels={level: sum(p.read_level == level for p in new_papers)
+                                    for level in ("full_text", "excerpt", "abstract", "title")})
         if summary['papers_with_accepted_evidence'] < self.config.min_selected_papers:
             summary['discovery_stop_reason'] = summary['stop_reason']
             summary.update(status='partial', stop_reason='readable_evidence_target_not_met')
@@ -266,7 +290,7 @@ class LiteraturePipeline:
         claims = tuple(Claim(id="CLL_" + digest(c.model_dump(mode="json"))[:16], **c.model_dump())
                        for c in synthesis.claims if normalize(c.statement).casefold() not in prior)
         retrieval_limits = tuple("检索失败：" + e["provider"] + "；" + e["query"]
-                                 for e in self.tools.events if e.get("status") == "failed")
+                                 for e in self.tools.events if e.get("status") == "failed" and e.get("operation") == "search")
         overview = LiteratureOverview(summary=synthesis.summary, gaps=synthesis.gaps, conflicts=synthesis.conflicts,
                     coverage_limitations=tuple(dict.fromkeys(synthesis.coverage_limitations + selection.coverage_limitations
                                                              + tuple(limitations) + retrieval_limits)))
@@ -284,6 +308,9 @@ def literature_report(state, retrieval_summary=None):
         s = retrieval_summary
         status = '达到本轮数量目标' if s['status'] == 'target_met' else '覆盖不足'
         lines += [f"检索候选 {s['unique_candidates']} 篇 → 入选 {s['selected_papers']} 篇 → 阅读 {s.get('documents_read', 0)} 篇 → 有核查证据 {s.get('papers_with_accepted_evidence', 0)} 篇。{status}；不代表穷尽领域文献。", ""]
+        if s.get("read_levels"):
+            counts = s["read_levels"]
+            lines += [f"材料范围：全文 {counts['full_text']}；正文摘录 {counts['excerpt']}；摘要 {counts['abstract']}；仅标题 {counts['title']}。", ""]
     lines += [state.literature.summary, "", "## 原文证据", ""]
     papers = {p.id: p for p in state.papers}
     for e in state.evidence:

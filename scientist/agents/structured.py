@@ -18,7 +18,13 @@ class StructuredAgent:
         self.attempts = []
 
     def output_schema(self, inputs):
-        return self.output_type.model_json_schema()
+        schema = self.output_type.model_json_schema()
+        query = schema.get("$defs", {}).get("SearchQuery")
+        if query:
+            # Keep historical query records readable while requiring source choices in new LLM outputs.
+            query["required"] = list(query["properties"])
+            query["properties"]["providers"].pop("default", None)
+        return schema
 
     def run(self, inputs: dict, validate=lambda value: None):
         instructions = (Path(__file__).resolve().parents[1] / "prompts" / (self.role + ".txt")).read_text(encoding="utf-8")

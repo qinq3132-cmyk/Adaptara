@@ -3,14 +3,16 @@ import hashlib
 import ipaddress
 import json
 import os
+import random
 import re
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 from xml.etree import ElementTree
 
@@ -49,7 +51,7 @@ class LiteratureHTTP:
         proxies = {p: os.environ.get(p.upper() + "_PROXY", os.environ.get(p + "_proxy", ""))
                    for p in ("http", "https")}
         self.opener = build_opener(ProxyHandler({k: v for k, v in proxies.items() if v}))
-        self.last_arxiv_request = 0.0
+        self.last_requests, self.cooldowns = {}, {}
         self.fetched_at = "not_recorded"
 
     def get(self, url: str, headers: dict | None = None) -> tuple[bytes, str]:
@@ -64,10 +66,13 @@ class LiteratureHTTP:
             self.fetched_at = receipt.get("fetched_at", "not_recorded")
             return data, receipt["content_type"]
         request = Request(url, headers={"User-Agent": "AutonomousScientist/0.1 (literature research)", **(headers or {})})
+        host = urlsplit(url).hostname
         for attempt in range(self.retries + 1):
-            if urlsplit(url).hostname == "export.arxiv.org":
-                time.sleep(max(0, 3 - (time.monotonic() - self.last_arxiv_request)))
-                self.last_arxiv_request = time.monotonic()
+            if self.cooldowns.get(host, 0) > time.monotonic():
+                raise RuntimeError("Literature HTTP request failed (status 429); source cooling down")
+            interval = 3 if host == "export.arxiv.org" else 1
+            time.sleep(max(0, interval - (time.monotonic() - self.last_requests.get(host, 0))))
+            self.last_requests[host] = time.monotonic()
             try:
                 with self.opener.open(request, timeout=self.timeout) as response:
                     public_url(response.geturl())
@@ -77,9 +82,23 @@ class LiteratureHTTP:
                     raise ValueError("Literature document exceeds download budget")
                 break
             except HTTPError as error:
+                delay = min(30, 2 ** attempt + random.uniform(0, 0.5))
+                retry_after = error.headers.get("Retry-After") if error.headers else None
+                if retry_after:
+                    try:
+                        delay = max(delay, float(retry_after))
+                    except ValueError:
+                        try:
+                            delay = max(delay, parsedate_to_datetime(retry_after).timestamp() - time.time())
+                        except (ValueError, TypeError, OverflowError):
+                            pass
+                if error.code == 429:
+                    self.cooldowns[host] = time.monotonic() + delay
                 if error.code not in {429, 500, 502, 503, 504} or attempt == self.retries:
                     raise RuntimeError(f"Literature HTTP request failed (status {error.code})") from None
-                time.sleep(min(3, 1 + attempt))
+                if delay > 30:
+                    raise RuntimeError(f"Literature HTTP request failed (status {error.code}); Retry-After exceeds wait budget") from None
+                time.sleep(delay)
             except (URLError, TimeoutError, OSError):
                 if attempt == self.retries:
                     raise RuntimeError("Literature HTTP request failed or timed out") from None
@@ -117,7 +136,11 @@ def deduplicate(candidates: list[PaperCandidate]) -> list[PaperCandidate]:
             "abstract": max((previous.abstract, candidate.abstract), key=len),
             "doi": previous.doi or candidate.doi,
             "arxiv_id": candidate.arxiv_id if newer else previous.arxiv_id or candidate.arxiv_id,
+            "pmid": previous.pmid or candidate.pmid,
+            "pmcid": previous.pmcid or candidate.pmcid,
             "fulltext_uri": candidate.fulltext_uri if newer else previous.fulltext_uri or candidate.fulltext_uri,
+            "fulltext_uris": tuple(dict.fromkeys(previous.fulltext_uris + candidate.fulltext_uris +
+                                                tuple(u for u in (previous.fulltext_uri, candidate.fulltext_uri) if u))),
             "providers": tuple(dict.fromkeys(previous.providers + candidate.providers)),
             "query_texts": tuple(dict.fromkeys(previous.query_texts + candidate.query_texts))})
     for candidate in candidates:
@@ -127,6 +150,10 @@ def deduplicate(candidates: list[PaperCandidate]) -> list[PaperCandidate]:
             keys.append("doi:" + candidate.doi.lower().removeprefix("https://doi.org/"))
         if aid:
             keys.append("arxiv:" + aid)
+        if candidate.pmid:
+            keys.append("pmid:" + candidate.pmid)
+        if candidate.pmcid:
+            keys.append("pmcid:" + candidate.pmcid.upper())
         matching = sorted({aliases[k] for k in keys if k in aliases})
         if not matching:
             index = len(merged)
@@ -148,37 +175,45 @@ class ArticleHTML(HTMLParser):
     def __init__(self):
         super().__init__()
         self.stack, self.parts, self.blocks = [], [], []
+        self.body_blocks = []
         self.heading = "Document"
         self.article_seen = False
+        self.abstract_section_level = None
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
-        in_article = any(a for _, a, _ in self.stack)
+        in_article = any(a for _, a, _, _ in self.stack)
         article = tag in {"article", "main"} or "ltx_document" in attrs.get("class", "").split()
-        excluded = tag in {"script", "style", "nav", "footer", "button"} or any(e for _, _, e in self.stack)
+        excluded = tag in {"script", "style", "nav", "footer", "button"} or any(e for _, _, e, _ in self.stack)
+        abstract = "abstract" in (attrs.get("id", "") + " " + attrs.get("class", "")).lower() or any(a for _, _, _, a in self.stack)
         if article:
             if not self.article_seen:
-                self.blocks, self.parts = [], []
+                self.blocks, self.parts, self.body_blocks = [], [], []
             self.article_seen = True
         if tag in {"p", "h1", "h2", "h3", "h4", "li", "figcaption"}:
             self.flush()
         if tag not in {"meta", "link", "br", "img", "hr", "input", "source", "wbr"}:
-            self.stack.append((tag, article or in_article, excluded))
+            self.stack.append((tag, article or in_article, excluded, abstract))
 
     def handle_endtag(self, tag):
         if tag in {"p", "h1", "h2", "h3", "h4", "li", "figcaption", "div"}:
             text = self.flush()
             if tag in {"h1", "h2", "h3", "h4"} and text:
                 self.heading = text
+                level = int(tag[1])
+                if re.match(r"^(abstract|摘要)\b", text, re.IGNORECASE):
+                    self.abstract_section_level = level
+                elif self.abstract_section_level is not None and level <= self.abstract_section_level:
+                    self.abstract_section_level = None
         for index in range(len(self.stack) - 1, -1, -1):
             if self.stack[index][0] == tag:
                 del self.stack[index:]
                 break
 
     def handle_data(self, data):
-        if any(e for _, _, e in self.stack):
+        if any(e for _, _, e, _ in self.stack):
             return
-        if self.article_seen and not any(a for _, a, _ in self.stack):
+        if self.article_seen and not any(a for _, a, _, _ in self.stack):
             return
         self.parts.append(data)
 
@@ -187,19 +222,25 @@ class ArticleHTML(HTMLParser):
         self.parts = []
         if text:
             self.blocks.append((self.heading, text))
+            if self.abstract_section_level is None and not any(a for _, _, _, a in self.stack):
+                self.body_blocks.append((self.heading, text))
         return text
 
 
 class LiteratureTools:
-    def __init__(self, http: LiteratureHTTP):
+    def __init__(self, http: LiteratureHTTP, *, resolve_open_access=True):
         self.http = http
+        self.resolve_open_access = resolve_open_access
         self.events = []
         self.unavailable_providers = {}
 
     def search(self, queries: tuple[SearchQuery, ...], providers: tuple[str, ...], *, per_query=5, max_candidates=15):
         found = []
         for query in queries:
-            for provider in providers:
+            chosen_providers = query.providers or providers
+            if set(chosen_providers) - set(providers) or len(chosen_providers) != len(set(chosen_providers)):
+                raise ValueError("Query providers must be distinct configured sources")
+            for provider in chosen_providers:
                 if provider in self.unavailable_providers:
                     self.events.append({"operation": "search", "provider": provider, "query": query.text,
                                         "status": "skipped", "error": self.unavailable_providers[provider]})
@@ -225,6 +266,44 @@ class LiteratureTools:
         return ordered[:max_candidates]
 
     def _search(self, query, provider, count):
+        if provider == "europe_pmc":
+            params = {"query": query.text, "format": "json", "resultType": "core", "pageSize": count}
+            data, _ = self.http.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search?" + urlencode(params))
+            return self._europe_pmc_records(data, query.text)
+        if provider == "openalex":
+            params = {"search": query.text, "per_page": count}
+            headers = {"Authorization": "Bearer " + os.environ["OPENALEX_API_KEY"]} if os.environ.get("OPENALEX_API_KEY") else {}
+            data, _ = self.http.get("https://api.openalex.org/works?" + urlencode(params), headers)
+            try:
+                records = json.loads(data)["results"]
+                if not isinstance(records, list):
+                    raise ValueError("Invalid results")
+                result = []
+                for p in records:
+                    title = normalize(p.get("title") or p.get("display_name") or "")
+                    if not title:
+                        continue
+                    positions = {}
+                    for word, indices in (p.get("abstract_inverted_index") or {}).items():
+                        for index in indices:
+                            positions[int(index)] = word
+                    locations = [p.get("best_oa_location")] + (p.get("locations") or [])
+                    urls = tuple(dict.fromkeys(url for location in locations if location and location.get("is_oa")
+                                               for url in (location.get("pdf_url"), location.get("landing_page_url")) if url))
+                    ids = p.get("ids") or {}
+                    doi = (p.get("doi") or "").removeprefix("https://doi.org/") or None
+                    pmid = (ids.get("pmid") or "").rstrip("/").rsplit("/", 1)[-1] or None
+                    pmcid = (ids.get("pmcid") or "").rstrip("/").rsplit("/", 1)[-1] or None
+                    result.append(PaperCandidate(id=candidate_id(title), title=title,
+                        abstract=" ".join(positions[n] for n in sorted(positions)),
+                        authors=tuple(a["author"]["display_name"] for a in p.get("authorships", [])),
+                        year=p.get("publication_year"), doi=doi, pmid=pmid, pmcid=pmcid,
+                        source_uri="https://doi.org/" + doi if doi else p["id"],
+                        fulltext_uri=urls[0] if urls else None, fulltext_uris=urls,
+                        providers=(provider,), query_texts=(query.text,)))
+                return result
+            except (ValueError, KeyError, TypeError, AttributeError):
+                raise RuntimeError("OpenAlex returned invalid metadata records") from None
         if provider == "crossref":
             params = {"query.bibliographic": query.text, "rows": count}
             data, _ = self.http.get("https://api.crossref.org/works?" + urlencode(params))
@@ -253,6 +332,7 @@ class LiteratureTools:
                                       for a in p.get("author", [])),
                         year=dates[0][0] if dates and dates[0] else None, doi=doi,
                         source_uri="https://doi.org/" + doi, fulltext_uri=links[0] if links else None,
+                        fulltext_uris=tuple(dict.fromkeys(links)),
                         providers=(provider,), query_texts=(query.text,)))
                 return result
             except (ValueError, KeyError, TypeError, AttributeError):
@@ -282,6 +362,7 @@ class LiteratureTools:
                 return [PaperCandidate(id=candidate_id(p["title"]), title=p["title"], abstract=p.get("abstract") or "",
                             authors=tuple(a["name"] for a in p.get("authors", [])), year=p.get("year"),
                             doi=(p.get("externalIds") or {}).get("DOI"), arxiv_id=(p.get("externalIds") or {}).get("ArXiv"),
+                            pmid=(p.get("externalIds") or {}).get("PubMed"), pmcid=(p.get("externalIds") or {}).get("PubMedCentral"),
                             source_uri=p.get("url") or "https://www.semanticscholar.org/paper/" + p["paperId"],
                             fulltext_uri=(p.get("openAccessPdf") or {}).get("url"),
                             providers=(provider,), query_texts=(query.text,)) for p in payload["data"]]
@@ -316,16 +397,138 @@ class LiteratureTools:
                 providers=(provider,), query_texts=(query.text,)))
         return result
 
+    @staticmethod
+    def _europe_pmc_records(data, query_text):
+        try:
+            records = json.loads(data)["resultList"]["result"]
+            if not isinstance(records, list):
+                raise ValueError("Invalid results")
+            result = []
+            for p in records:
+                title = normalize(p.get("title") or "")
+                if not title:
+                    continue
+                parser = ArticleHTML()
+                parser.feed(p.get("abstractText") or "")
+                parser.flush()
+                pmcid = p.get("pmcid")
+                urls = []
+                if pmcid and p.get("isOpenAccess") == "Y":
+                    urls.append("https://www.ebi.ac.uk/europepmc/webservices/rest/" + quote(pmcid, safe="") + "/fullTextXML")
+                for item in (p.get("fullTextUrlList") or {}).get("fullTextUrl", []):
+                    if item.get("availabilityCode") == "OA" and item.get("url"):
+                        urls.append(item["url"])
+                doi = p.get("doi")
+                source = p.get("source") or "MED"
+                identifier = p["id"]
+                names = (p.get("authorList") or {}).get("author", [])
+                result.append(PaperCandidate(id=candidate_id(title), title=title,
+                    abstract=" ".join(t for _, t in parser.blocks),
+                    authors=tuple(a.get("fullName") or "" for a in names),
+                    year=int(p["pubYear"]) if p.get("pubYear") else None, doi=doi,
+                    pmid=identifier if source == "MED" else None, pmcid=pmcid,
+                    source_uri="https://doi.org/" + doi if doi else "https://europepmc.org/article/" + source + "/" + identifier,
+                    fulltext_uri=urls[0] if urls else None, fulltext_uris=tuple(dict.fromkeys(urls)),
+                    providers=("europe_pmc",), query_texts=(query_text,)))
+            return result
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise RuntimeError("Europe PMC returned invalid metadata records") from None
+
+    def _resolve_fulltext(self, paper):
+        """Resolve only selected papers, keeping metadata and access failures separate."""
+        urls, versions = [], {}
+        if not self.resolve_open_access or not paper.doi:
+            return urls, versions
+        email = os.environ.get("UNPAYWALL_EMAIL")
+        if email:
+            try:
+                data, _ = self.http.get("https://api.unpaywall.org/v2/" + quote(paper.doi.removeprefix("https://doi.org/"), safe="") + "?" + urlencode({"email": email}))
+                payload = json.loads(data)
+                if not isinstance(payload, dict) or "oa_locations" not in payload:
+                    raise ValueError("Invalid locations")
+                locations = [payload.get("best_oa_location")] + payload["oa_locations"]
+                for location in locations:
+                    if not location:
+                        continue
+                    for url in (location.get("url_for_pdf"), location.get("url_for_landing_page")):
+                        if url:
+                            urls.append(url)
+                            versions[url] = location.get("version") or "unknown"
+                self.events.append({"operation": "resolve", "provider": "unpaywall", "paper_id": paper.id,
+                                    "status": "ok", "locations": [{"url": u, "version": versions[u]} for u in dict.fromkeys(urls)]})
+            except (RuntimeError, ValueError, KeyError, TypeError, AttributeError) as error:
+                self.events.append({"operation": "resolve", "provider": "unpaywall", "paper_id": paper.id,
+                                    "status": "failed", "error": str(error)})
+        else:
+            self.events.append({"operation": "resolve", "provider": "unpaywall", "paper_id": paper.id,
+                                "status": "skipped", "error": "UNPAYWALL_EMAIL is not configured"})
+        if not paper.pmcid:
+            try:
+                params = {"query": 'DOI:"' + paper.doi.replace('"', '') + '"', "format": "json", "resultType": "core", "pageSize": 1}
+                data, _ = self.http.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search?" + urlencode(params))
+                matches = self._europe_pmc_records(data, "DOI lookup")
+                for match in matches:
+                    if match.doi and match.doi.casefold() == paper.doi.removeprefix("https://doi.org/").casefold():
+                        urls.extend(match.fulltext_uris)
+                self.events.append({"operation": "resolve", "provider": "europe_pmc", "paper_id": paper.id,
+                                    "status": "ok", "returned": len(matches)})
+            except (RuntimeError, ValueError) as error:
+                self.events.append({"operation": "resolve", "provider": "europe_pmc", "paper_id": paper.id,
+                                    "status": "failed", "error": str(error)})
+        return list(dict.fromkeys(urls)), versions
+
+    @staticmethod
+    def _xml_blocks(data):
+        root = ElementTree.fromstring(data)
+        article = root if root.tag == "article" else root.find(".//article")
+        if article is None or article.find("body") is None:
+            raise RuntimeError("XML has no article body")
+        if len(normalize(" ".join(article.find("body").itertext()))) < 500:
+            raise RuntimeError("XML has no usable full-text body")
+        blocks = []
+        def visit(node, heading):
+            if node.tag == "sec":
+                title = node.find("title")
+                if title is not None:
+                    heading = normalize(" ".join(title.itertext())) or heading
+            if node.tag in {"p", "caption", "table-wrap"}:
+                text = normalize(" ".join(node.itertext()))
+                if text:
+                    blocks.append((heading, text))
+                return
+            for child in node:
+                visit(child, heading)
+        for name in ("front", "body", "back"):
+            node = article.find(name)
+            if node is not None:
+                visit(node, {"front": "Abstract", "body": "Body", "back": "References"}[name])
+        return blocks
+
     def fetch_document(self, paper: PaperCandidate, *, max_characters=36000, allow_abstract=True) -> PaperDocument:
         urls = []
+        if paper.pmcid:
+            urls.append("https://www.ebi.ac.uk/europepmc/webservices/rest/" + quote(paper.pmcid, safe="") + "/fullTextXML")
         if paper.arxiv_id:
             urls.append("https://arxiv.org/html/" + paper.arxiv_id)
         if paper.fulltext_uri:
             urls.append(paper.fulltext_uri)
-        if not urls:
-            urls.append(paper.source_uri)
+        urls.extend(paper.fulltext_uris)
+        urls.append(paper.source_uri)
+        urls = list(dict.fromkeys(urls))[:8]
         limitations, blocks, chosen = [], [], paper.source_uri
-        for url in dict.fromkeys(urls):
+        versions, resolved, index = {}, False, 0
+        while True:
+            if index >= len(urls):
+                if resolved:
+                    break
+                additional, versions = self._resolve_fulltext(paper)
+                urls.extend(u for u in additional if u not in urls)
+                urls = urls[:12]
+                resolved = True
+                if index >= len(urls):
+                    break
+            url = urls[index]
+            index += 1
             try:
                 data, kind = self.http.get(url)
                 if data.startswith(b"%PDF") or "application/pdf" in kind:
@@ -338,6 +541,8 @@ class LiteratureTools:
                                   for n, p in enumerate(PdfReader(BytesIO(data)).pages, 1)]
                     except Exception:
                         raise RuntimeError("PDF could not be parsed as readable text") from None
+                elif "xml" in kind or url.endswith("/fullTextXML"):
+                    blocks = self._xml_blocks(data)
                 else:
                     parser = ArticleHTML()
                     parser.feed(data.decode("utf-8", errors="replace"))
@@ -345,21 +550,37 @@ class LiteratureTools:
                     if not parser.article_seen:
                         raise RuntimeError("Page does not identify an article body")
                     blocks = parser.blocks
+                    # Publisher abstract/landing pages also use <article>. Require a body section.
+                    body_heading = r"\b(introduction|background|methods|materials|results|discussion|conclusion|main|正文|结果|方法)\b"
+                    if sum(len(t) for h, t in parser.body_blocks if re.search(body_heading, h, re.IGNORECASE)) < 500:
+                        raise RuntimeError("HTML has no identifiable full-text scientific body")
                 blocks = [(h, t) for h, t in blocks if len(t) > 20]
                 if sum(len(t) for _, t in blocks) < 500:
                     raise RuntimeError("Document has no usable article body")
                 chosen = url
+                if versions.get(url):
+                    limitations.append("开放全文版本：" + versions[url] + "；来源：" + url)
+                self.events.append({"operation": "download", "paper_id": paper.id, "source_uri": url,
+                                    "status": "ok", "content_version": versions.get(url)})
                 break
-            except (RuntimeError, ValueError, OSError) as error:
+            except (RuntimeError, ValueError, OSError, ElementTree.ParseError) as error:
                 blocks = []
-                limitations.append(f"正文获取失败：{type(error).__name__}；{url}")
+                reason = str(error)
+                limitations.append(f"正文获取失败：{reason}；{url}")
+                self.events.append({"operation": "download", "paper_id": paper.id, "source_uri": url,
+                                    "status": "failed", "error": reason})
         level = "full_text"
         if not blocks:
-            if not allow_abstract or not paper.abstract.strip():
+            if not allow_abstract:
                 raise RuntimeError("Selected paper has no readable text within acquisition policy")
-            blocks = [("Abstract", paper.abstract)]
-            level = "abstract"
-            limitations.append("仅取得摘要；不能据此推断正文实验细节或独立验证作者结论。")
+            if paper.abstract.strip():
+                blocks = [("Abstract", paper.abstract)]
+                level = "abstract"
+                limitations.append("仅取得摘要；标题用于相关性判断，不能据此推断正文实验细节或独立验证作者结论。")
+            else:
+                blocks = [("Title", paper.title)]
+                level = "title"
+                limitations.append("仅取得标题，只能初步判断相关性，不能作为科学结论的证据。")
         if sum(len(t) for _, t in blocks) > max_characters:
             # Keep the start and end; explicitly declare that middle sections were not read.
             start_budget, end_budget = max_characters * 2 // 3, max_characters // 3

@@ -1,6 +1,6 @@
 # Sequential scientific roles; all model calls are tool-free.
 # Python executes search/download tools with bounded acquisition budgets.
-providers: [semantic_scholar, arxiv, crossref]
+providers: [semantic_scholar, arxiv, crossref, europe_pmc, openalex]
 max_queries: 4
 results_per_query: 6
 max_candidates: 40
@@ -10,6 +10,7 @@ min_selected_papers: 3
 max_search_rounds: 3
 max_characters_per_paper: 36000
 allow_abstract: true
+resolve_open_access: true
 http_timeout_seconds: 25
 max_revision_rounds: 1
 max_supplement_rounds: 1
