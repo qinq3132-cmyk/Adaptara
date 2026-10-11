@@ -2,7 +2,7 @@
 
 项目通过独立 `codex exec` 子进程执行科研角色。当前默认配置为：
 
-- 模型：`glm-5.3-flash`，网关：`http://39.105.190.188:3456/v1`。
+- 默认模型：`glm-5.3`，网关：`http://39.105.190.188:3456/v1`。
 - 密钥来源：OpenCode 的 `Lemon-Domestic` provider。不复制到 YAML、命令参数或研究产物。
 - 认证：只给子进程设置 `SCIENTIST_CODEX_GATEWAY_KEY`，通过自定义 provider 的 `env_key` 使用。
 - `requires_openai_auth=false`，避免使用全局 ChatGPT 登录；这是与官方登录并存的关键。
@@ -13,6 +13,43 @@
 全局配置中的 `requires_openai_auth=true` 适用于 Codex 自己的 API-key 登录路径。
 用户希望继续使用官方 ChatGPT 登录，因此本项目默认采用独立 `env_key` 认证，而不运行 `codex login`。
 可选 `codex_auth_mode: codex` 支持已有 API-key `auth.json` 的环境；它不会自动写入认证文件。
+可选 `codex_auth_mode: chatgpt` 使用官方内置 `openai` provider 和已有 ChatGPT 登录。
+该模式由 Codex 自己读取及刷新登录态，不提取令牌，也不调用网关；继承的 API key 和
+`OPENAI_BASE_URL` 会从这个子进程移除。默认 GLM 网关模式不受影响。
+
+## 官方 ChatGPT 登录切换
+
+本机已存在 ChatGPT 登录时，可以临时切换两个科研角色：
+
+```bash
+python run_scientist.py --clarify-question examples/adaptation_concept.json --codex-auth chatgpt --model gpt-6.1-sol
+python run_scientist.py --generate-hypotheses --codex-auth chatgpt --model gpt-6.1-sol
+```
+
+如需将已由人类确认的问题定义传入假设生成，沿用 `--confirmed-question` 和同一数据库。
+以上两条独立命令不意味着自动确认问题草案。
+
+按用户选择，官方科研调用使用 `gpt-6.1-sol`、`high`，不自动替换模型。
+旧客户端0.150.1调用时曾返回“不支持此模型”，其目录只展示5.6系列；
+同一登录态使用新版0.162.0-alpha.2后，原始问题的解析和假设生成均首次通过。
+因此不能仅凭旧客户端的拒绝判断账户没有6.1权限。模型目录本身也不能证明权限，
+以完成推理请求为准；GLM模型不能借用ChatGPT登录调用。
+
+`codex_chatgpt_executable` 和 `codex_chatgpt_sandbox_backend` 单独配置官方路径的客户端
+和沙箱；未设置时沿用通用Codex配置。`--codex-bin` 的显式覆盖优先于两种认证配置。
+当前官方路径为新版客户端、默认只读沙箱；网关及文件阅读继续保留已验证的旧版Landlock配置。
+新版已验证无工具的科研解析和假设生成；本机文件工具的命名空间限制仍需另行处理。
+
+持久切换仍可编辑 `config/models.yaml`：设置 `backend: codex`、官方 `model` ID 和
+`codex_auth_mode: chatgpt`；建议同时清空 `codex_base_url`、`codex_credential_provider`，
+并设置 `codex_provider_id: openai`。官方登录模式不会使用继承的网关 URL 或密钥。
+回到 GLM 时恢复原网关配置，或者在保留默认配置的情况下省略上面的命令行覆盖。
+
+切换成本主要是账户模型权限、登录续期/额度、CLI版本与结构化输出兼容性；
+科研提示词、Python输出校验以及人类确认流程共用。两种认证路径均关闭科研角色的工具权限。
+使用已有登录可能由 Codex 正常刷新其凭据，但项目不执行登录、注销或重写全局配置。
+这是通过 Codex CLI 调用订阅账户下的模型，不等同于获得通用的 OpenAI Platform API key。
+官方说明：[认证方式](https://learn.chatgpt.com/docs/auth)。
 
 ## 使用
 
@@ -85,6 +122,9 @@ Codex 的可执行文件可通过 `--codex-bin` 覆盖。项目 `config/models.y
 | 代码 | 含义与处理 |
 | --- | --- |
 | `credential_missing` | OpenCode 未配置 API key；或主动选择原生认证但 `auth.json` 仅有 ChatGPT 登录。保持原登录，优先使用默认 OpenCode 认证桥接。 |
+| `chatgpt_model_unavailable` | 当前官方登录账户不支持所选模型；查询账户 Codex 模型目录后实际调用验证。 |
+| `runtime_config_invalid` | CLI 拒绝配置，例如覆盖官方内置 provider；检查所用 CLI 版本及其支持的设置。 |
+| `output_schema_rejected` | 官方 provider 拒绝结构化输出 schema；检查严格 schema 要求，不接受未校验输出。 |
 | `provider_auth_failed` | API key 被拒绝，检查网关密钥及权限。 |
 | `responses_endpoint_missing` | 检查 `/v1/responses` 路由，Chat Completions 兼容性不能替代。 |
 | `sandbox_namespace_denied` | 容器限制命名空间，采用上面已验证的独立安装或调整宿主隔离。 |

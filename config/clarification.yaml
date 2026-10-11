@@ -1,0 +1,20 @@
+# Problem clarification uses three independent drafts followed by one synthesis.
+mode: ensemble
+candidates:
+  - model: glm-5.3
+    auth_mode: opencode
+    reasoning_effort: high
+    timeout_seconds: 300
+  - model: deepseek-v4.1-flash
+    auth_mode: opencode
+    reasoning_effort: high
+    timeout_seconds: 300
+  - model: gpt-6.1-sol
+    auth_mode: chatgpt
+    reasoning_effort: high
+    timeout_seconds: 600
+synthesizer:
+  model: gpt-6.1-sol
+  auth_mode: chatgpt
+  reasoning_effort: high
+  timeout_seconds: 600

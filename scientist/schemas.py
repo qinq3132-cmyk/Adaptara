@@ -2,7 +2,7 @@
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_serializer, model_validator
 
 Text = Annotated[str, Field(min_length=1)]
 Score = Annotated[float, Field(ge=0, le=1)]
@@ -38,6 +38,15 @@ class Paper(Record):
     id: Text
     title: Text
     source_uri: Text
+    doi: str | None = None
+    arxiv_id: str | None = None
+    version: str | None = None
+    content_sha256: str | None = None
+    read_level: Literal["abstract", "excerpt", "full_text"] | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_optional(self, handler):
+        return {k: v for k, v in handler(self).items() if v is not None}
 
 
 class Claim(Record):
@@ -128,6 +137,18 @@ class Evidence(Record):
     contradicts: tuple[Text, ...] = ()
     strength: Literal["weak", "moderate", "strong"]
     limitations: tuple[Text, ...] = Field(min_length=1)
+    quote: Text | None = None
+    locator: Text | None = None
+    content_sha256: str | None = None
+    conditions: tuple[Text, ...] = ()
+    verification: Literal["accepted"] | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_optional(self, handler):
+        data = {k: v for k, v in handler(self).items() if v is not None}
+        if not self.conditions:
+            data.pop("conditions", None)
+        return data
 
     @model_validator(mode="after")
     def consistent_direction(self):

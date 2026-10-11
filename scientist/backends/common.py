@@ -1,6 +1,10 @@
 """Runtime-neutral responses and failures."""
 from dataclasses import dataclass
 
+TOOL_FREE_ROLES = {"hypothesis", "problem_clarification", "problem_synthesis", "literature_search",
+                   "literature_screening", "literature_reading", "evidence_verification",
+                   "literature_synthesis", "hypothesis_review", "hypothesis_revision"}
+
 
 @dataclass(frozen=True)
 class ReasoningResponse:

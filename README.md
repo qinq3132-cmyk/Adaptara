@@ -1,11 +1,23 @@
 # Autonomous Scientist
 
+Problem clarification now supports **human concept → three independent model drafts →
+GPT-6.1-Sol high synthesis → human feedback → explicit version confirmation → hypothesis generation**.
+Start with `python run_scientist.py --clarify-question examples/adaptation_concept.json`.
+See [the problem clarification workflow](docs/problem_clarification.md) for review,
+confirmation, persistence and the confirmed-question input to hypothesis generation.
+
+After confirmation, `--research-literature` produces traceable papers, evidence and
+claims. `--research` connects this literature state to hypothesis generation,
+independent review and bounded revision. Each role has a separate prompt and
+configurable model; see [the literature and hypothesis agents](docs/literature_agents.md).
+Install PDF reading support with `python -m pip install -e '.[literature]'`.
+
 The default demo runs one offline scientific cycle, with deterministic mock
 reasoning and an executable arithmetic counterexample. An explicit hypothesis
 generation mode calls Codex (or OpenCode) with a configured model provider, and a
 bounded local document reader uses Codex file tools. The offline demo needs no
 API key or model download; reasoning modes reuse existing OpenCode credentials.
-Literature retrieval, real benchmarks, an autonomous multi-round scheduler and
+Real benchmarks, an autonomous multi-round scheduler and
 hardware integration remain future work.
 
 ## Run
@@ -164,7 +176,7 @@ These are not claimed by the current accounting checks.
 
 The full requested specification is preserved in `SPEC.md`. Its Milestone 1 and the explicit E002 follow-up described below
 are implemented, along with model-authored hypothesis generation through Codex/OpenCode
-and local text/Markdown document reading. Future literature retrieval, real environments, baselines,
+and local text/Markdown document reading. Literature research and pre-experiment hypothesis review are available through the explicit research modes. Real environments, baselines,
 generated code execution, adaptive experiment selection across rounds, and hardware
 work remain deferred. Reserved directories contain notes rather than executable
 stubs that could be mistaken for working later-phase functionality.
@@ -243,12 +255,19 @@ python run_scientist.py --generate-hypotheses --state-file artifacts/run_<uuid>/
 ```
 
 `config/models.yaml` contains only nonsecret execution settings. This project
-now uses Codex with `glm-5.3-flash` at the supplied gateway, reusing the same
+now uses Codex with `glm-5.3` at the supplied gateway, reusing the same
 API key from OpenCode's `Lemon-Domestic` provider in its child process only.
 It does not change global Codex config/auth or the existing ChatGPT login.
 The verified standalone Codex 0.150.1 and its read-only Landlock sandbox are
 selected in `config/models.yaml`; the IDE Codex has a namespace restriction here.
 See [Codex setup, isolation and diagnostics](docs/codex_backend.md).
+
+To reuse an existing official ChatGPT login for a temporary run, pass
+`--codex-auth chatgpt --model gpt-6.1-sol` to clarification or hypothesis generation.
+Use a model supported by that account; the gateway model and credentials are not
+used in this mode. The default remains GLM 5.3.
+Official ChatGPT mode selects the separately configured newer Codex executable;
+the requested reasoning effort remains `high`.
 
 For the OpenCode backend, override the executable with `--opencode-bin` or
 `SCIENTIST_OPENCODE_BIN`, and the configuration path with `--opencode-config`.
@@ -257,8 +276,8 @@ The adapter calls the installed `opencode run --pure --format json --agent
 hypothesis --model <provider/model>` in a fresh temporary working directory.
 The role uses a two-step ceiling to avoid the one-step assistant-summary prefill
 that this compatible model rejects. The supplied role has no tool permissions; hypothesis generation needs only the
-provided question, claims and recorded research. Literature roles can later use
-a separate configuration for reading and retrieval tools.
+provided question, claims and recorded research. Literature agents use the same
+tool-free model calls; Python performs retrieval under `config/literature.yaml` budgets.
 
 The model supplies claims, mechanisms, assumptions, predictions, alternatives
 and falsification conditions. Python assigns globally noncolliding H IDs,

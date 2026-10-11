@@ -1,4 +1,4 @@
-"""Codex runtime using an existing OpenCode provider's Responses endpoint.
+"""Codex runtime using a gateway or Codex's official ChatGPT login.
 
 No global configuration is changed. Credentials exist only in the invocation
 environment, and are excluded from the environment of model-generated commands.
@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .common import BackendError, ReasoningResponse
+from .common import BackendError, ReasoningResponse, TOOL_FREE_ROLES
 
 KEY_ENV = "SCIENTIST_CODEX_GATEWAY_KEY"
 TOOL_TYPES = {"command_execution", "file_change", "mcp_tool_call", "web_search"}
@@ -121,11 +121,17 @@ def load_provider(model: str, config: Path | None = None, *, require_declared_mo
 
 def failure_code(output: str) -> str:
     lower = output.lower()
+    if "error loading config" in lower or "reserved built-in provider ids" in lower:
+        return "runtime_config_invalid"
+    if "not supported when using codex with a chatgpt account" in lower:
+        return "chatgpt_model_unavailable"
+    if "invalid_json_schema" in lower or "invalid schema for response_format" in lower:
+        return "output_schema_rejected"
     if "requires bubblewrap" in lower and "app-server sockets" in lower:
         return "landlock_incompatible"
     if "namespace" in lower and ("bwrap" in lower or "operation not permitted" in lower):
         return "sandbox_namespace_denied"
-    if "landlock" in lower and ("not supported" in lower or "failed" in lower):
+    if re.search(r"landlock (?:is )?(?:not supported|unavailable)|failed to (?:apply|initialize|create) (?:the )?landlock", lower):
         return "landlock_unavailable"
     if any(token in lower for token in ("401", "403", "unauthorized", "invalid api key")):
         return "provider_auth_failed"
@@ -135,10 +141,13 @@ def failure_code(output: str) -> str:
 
 
 FAILURE_HELP = {
+    "runtime_config_invalid": "Codex rejected runtime configuration. Do not override reserved built-in provider IDs; check the selected Codex version's supported settings.",
+    "chatgpt_model_unavailable": "This Codex ChatGPT invocation rejected the selected model. Check the CLI version and account access; do not silently substitute a different model.",
+    "output_schema_rejected": "The official provider rejected the output schema. Check strict structured-output requirements; no scientific output was accepted.",
     "sandbox_namespace_denied": "The container denies user namespaces. Use a host/container allowing bubblewrap, or a verified standalone Codex version with working Landlock. See docs/codex_backend.md.",
     "landlock_incompatible": "This Codex version requires bubblewrap even in legacy Landlock mode. Use the verified standalone installation described in docs/codex_backend.md, or fix container isolation.",
     "landlock_unavailable": "Landlock is unavailable on this kernel. Use the default sandbox on a host/container supporting user namespaces.",
-    "provider_auth_failed": "Check the selected OpenCode provider's API credentials and permissions.",
+    "provider_auth_failed": "Check the selected gateway credentials or official Codex login and account permissions.",
     "responses_endpoint_missing": "The gateway must implement POST /v1/responses with SSE and function-call continuation; Chat Completions alone is insufficient.",
     "runtime_or_provider_failed": "Check Responses streaming/tool compatibility, proxy configuration and Codex version. Raw provider errors are suppressed to protect credentials.",
 }
@@ -204,14 +213,18 @@ class CodexBackend:
                  sandbox_backend: str = "default", model_catalog: Path | None = None,
                  auth_mode: str = "opencode", base_url: str | None = None,
                  provider_id: str = "OpenAI", reasoning_effort: str | None = None,
-                 reasoning_summary: str | None = None, credential_provider: str | None = None):
+                 reasoning_summary: str | None = None, credential_provider: str | None = None,
+                 role: str = "hypothesis"):
+        if role not in TOOL_FREE_ROLES:
+            raise ValueError("Unsupported tool-free scientific role")
+        self.role = role
         if not 0 < timeout_seconds <= 600:
             raise ValueError("Codex timeout must be in (0, 600] seconds")
         if proxy_env_precedence not in {"inherit", "uppercase"} or sandbox_backend not in {"default", "landlock"}:
             raise ValueError("Invalid proxy precedence or Codex sandbox backend")
         self.executable = locate_codex(executable)
-        if auth_mode not in {"opencode", "codex"}:
-            raise ValueError("Codex auth mode must be opencode or codex")
+        if auth_mode not in {"opencode", "codex", "chatgpt"}:
+            raise ValueError("Codex auth mode must be opencode, codex or chatgpt")
         self.auth_mode = auth_mode
         if auth_mode == "opencode":
             credential_model = f"{credential_provider}/{model}" if credential_provider and "/" not in model else model
@@ -221,8 +234,14 @@ class CodexBackend:
                 if url.scheme not in {"http", "https"} or not url.hostname or url.username or url.password or url.query or url.fragment:
                     raise ValueError("Codex base URL must not contain embedded credentials")
                 self.provider = replace(self.provider, base_url=base_url.rstrip("/"))
-        else:
+        elif auth_mode == "codex":
             self.provider = native_provider(model, base_url, provider_id)
+        else:
+            if "/" in model or not model.strip():
+                raise ValueError("ChatGPT auth requires an official Codex model ID, not provider/model")
+            # Codex loads and refreshes its existing official login itself.
+            # Never bridge that credential to a gateway or extract its tokens.
+            self.provider = Provider("openai", model, "https://chatgpt.com/backend-api", "")
         self.model, self.timeout_seconds = model, timeout_seconds
         self.reasoning_effort, self.reasoning_summary = reasoning_effort, reasoning_summary
         self.proxy_env_precedence, self.sandbox_backend = proxy_env_precedence, sandbox_backend
@@ -234,7 +253,7 @@ class CodexBackend:
         try:
             schema = json.loads(prompt)["output_schema"]
         except (ValueError, KeyError, TypeError):
-            raise ValueError("Codex hypothesis requests require an output_schema") from None
+            raise ValueError("Codex scientific requests require an output_schema") from None
         return self._invoke(instructions=instructions, prompt=prompt, schema=schema)
 
     def read_document(self, text: str) -> ReasoningResponse:
@@ -255,6 +274,11 @@ class CodexBackend:
                     env[key.lower()] = env[key]
         if self.auth_mode == "opencode":
             env[KEY_ENV] = self.provider.key
+        elif self.auth_mode == "chatgpt":
+            # Prevent inherited API credentials or endpoint overrides from
+            # changing this explicitly selected subscription-auth route.
+            for key in (KEY_ENV, "CODEX_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL"):
+                env.pop(key, None)
         with tempfile.TemporaryDirectory(prefix="scientist-codex-") as folder:
             workdir = Path(folder)
             schema_path, answer_path = workdir / "schema.json", workdir / "answer.json"
@@ -267,7 +291,14 @@ class CodexBackend:
                         "features.apps": False, "features.plugins": False, "features.hooks": False,
                         "features.shell_tool": document is not None, "features.unified_exec": document is not None,
                         "shell_environment_policy.inherit": "core", "shell_environment_policy.ignore_default_excludes": False,
-                        "disable_response_storage": True,
+                        "disable_response_storage": True}
+            if self.auth_mode == "chatgpt":
+                settings["forced_login_method"] = "chatgpt"
+                settings["chatgpt_base_url"] = self.provider.base_url
+                # The official built-in provider is reserved: even partial
+                # model_providers.openai overrides fail at startup.
+            else:
+                settings.update({
                         f"model_providers.{runtime_provider}.name": "OpenCode configured gateway" if self.auth_mode == "opencode" else runtime_provider,
                         f"model_providers.{runtime_provider}.base_url": self.provider.base_url,
                         f"model_providers.{runtime_provider}.wire_api": "responses",
@@ -275,10 +306,10 @@ class CodexBackend:
                         f"model_providers.{runtime_provider}.supports_websockets": False,
                         f"model_providers.{runtime_provider}.request_max_retries": 0,
                         f"model_providers.{runtime_provider}.stream_max_retries": 0,
-                        f"model_providers.{runtime_provider}.stream_idle_timeout_ms": min(int(self.timeout_seconds * 1000), 60000)}
+                        f"model_providers.{runtime_provider}.stream_idle_timeout_ms": min(int(self.timeout_seconds * 1000), 60000)})
             if self.auth_mode == "opencode":
                 settings[f"model_providers.{runtime_provider}.env_key"] = KEY_ENV
-            else:
+            elif self.auth_mode == "codex":
                 settings["features.api_key_model_discovery"] = True
             if self.reasoning_effort:
                 settings["model_reasoning_effort"] = self.reasoning_effort
@@ -326,14 +357,16 @@ class CodexBackend:
                 raise CodexError("final_output_missing", "No final output file was produced") from None
             if final_text != response.text.strip():
                 raise CodexError("final_output_mismatch", "Final output does not match the completed message")
-            if self.provider.key in final_text:
+            if self.provider.key and self.provider.key in final_text:
                 raise CodexError("credential_in_output", "Credential material was detected; output was discarded")
         return ReasoningResponse(final_text, {**response.metadata, "backend": self.name, "model": self.model,
                                  "provider": self.provider.provider_id, "wire_api": "responses", "executable": self.executable,
                                  "auth_mode": self.auth_mode,
+                                 "reasoning_effort_requested": self.reasoning_effort,
+                                 "reasoning_summary_requested": self.reasoning_summary,
                                  "sandbox": "read-only", "sandbox_backend": self.sandbox_backend,
                                  "proxy_env_precedence": self.proxy_env_precedence,
-                                 "role": "document_reader" if document is not None else "hypothesis",
+                                 "role": "document_reader" if document is not None else self.role,
                                  "document_read_verified": document is not None,
                                  "tool_permissions": "read-only shell" if document is not None else "none",
                                  "elapsed_seconds": time.monotonic() - started})

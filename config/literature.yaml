@@ -1,0 +1,27 @@
+# Sequential scientific roles; all model calls are tool-free.
+# Python executes search/download tools with bounded acquisition budgets.
+providers: [semantic_scholar, arxiv, crossref]
+max_queries: 4
+results_per_query: 6
+max_candidates: 40
+max_selected_papers: 5
+min_candidates: 12
+min_selected_papers: 3
+max_search_rounds: 3
+max_characters_per_paper: 36000
+allow_abstract: true
+http_timeout_seconds: 25
+max_revision_rounds: 1
+max_supplement_rounds: 1
+roles:
+  evidence_verification:
+    model: glm-5.3
+    auth_mode: opencode
+    reasoning_effort: high
+    timeout_seconds: 300
+  hypothesis_review:
+    model: gpt-6.1-sol
+    auth_mode: chatgpt
+    reasoning_effort: high
+    timeout_seconds: 600
+  # Unlisted roles inherit config/models.yaml (currently GLM 5.3 high).

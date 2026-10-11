@@ -16,7 +16,8 @@ class ResearchStore:
     TABLES = {"questions": None, "papers": "papers", "claims": "knowledge",
               "hypotheses": "hypotheses", "experiments": "experiments", "results": "results",
               "evidence": "evidence", "decisions": "decisions", "analyses": "analyses",
-              "critiques": "critiques", "theory_updates": "theory_updates"}
+              "critiques": "critiques", "theory_updates": "theory_updates",
+              "hypothesis_reviews": "hypothesis_reviews"}
 
     def __init__(self, path: Path):
         self.path = Path(path)

@@ -7,7 +7,7 @@ import scientist.backends.codex as codex_module
 
 from run_scientist import main
 from scientist.backends.codex import CodexBackend, CodexError, KEY_ENV, failure_code, load_provider, native_provider, parse_events
-from scientist.hypothesis_generation import ReasoningConfig, generate_hypotheses, make_hypothesis_agent
+from scientist.hypothesis_generation import ReasoningConfig, generate_hypotheses, make_hypothesis_agent, make_reasoning_backend
 from test_hypothesis_generation import batch
 
 
@@ -109,6 +109,57 @@ def test_native_auth_json_api_key_and_chatgpt_distinction(monkeypatch):
     with pytest.raises(CodexError, match="credential_missing") as error:
         native_provider("model", "https://provider.example.test/v1", "OpenAI")
     assert "private-login-token" not in str(error.value)
+
+
+@pytest.mark.parametrize("role", sorted(codex_module.TOOL_FREE_ROLES))
+def test_chatgpt_uses_official_login_without_gateway_credentials(configured, monkeypatch, role):
+    executable, config = configured
+    for name in (KEY_ENV, "CODEX_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL"):
+        monkeypatch.setenv(name, "inherited-private-value")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("ChatGPT mode must not load or bridge API credentials")
+
+    monkeypatch.setattr(codex_module, "load_provider", forbidden)
+    monkeypatch.setattr(codex_module, "native_provider", forbidden)
+    observed = fake_popen(monkeypatch, '{"ok":true}')
+    backend = CodexBackend(model="gpt-6.1-sol", executable=str(executable), config=config,
+                           auth_mode="chatgpt", base_url="https://gateway.example.test/v1",
+                           credential_provider="test", role=role, reasoning_effort="high")
+    reply = backend.complete(instructions="role", prompt=json.dumps({"output_schema": {"type": "object"}}))
+    command = observed["command"]
+    assert 'model_provider="openai"' in command
+    assert 'forced_login_method="chatgpt"' in command
+    assert command[command.index("-m") + 1] == "gpt-6.1-sol"
+    assert 'model_reasoning_effort="high"' in command
+    assert 'chatgpt_base_url="https://chatgpt.com/backend-api"' in command
+    assert not any("model_providers.openai." in arg for arg in command)
+    assert not any("env_key=" in arg or "api_key_model_discovery" in arg for arg in command)
+    assert "gateway.example.test" not in " ".join(command)
+    assert not any(arg in {"login", "logout"} for arg in command)
+    for name in (KEY_ENV, "CODEX_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL"):
+        assert name not in observed["env"]
+    assert "--ignore-user-config" in command and "--ephemeral" in command
+    assert reply.metadata["auth_mode"] == "chatgpt" and reply.metadata["provider"] == "openai"
+    assert reply.metadata["role"] == role and reply.metadata["tool_permissions"] == "none"
+    assert reply.metadata["reasoning_effort_requested"] == "high"
+    assert reply.text == '{"ok":true}'
+
+
+def test_chatgpt_rejects_a_gateway_model_name(configured):
+    executable, _ = configured
+    with pytest.raises(ValueError, match="official Codex model ID"):
+        CodexBackend(model="gateway/model", executable=str(executable), auth_mode="chatgpt")
+
+
+def test_landlock_deprecation_does_not_mask_official_provider_errors():
+    warning = "use_legacy_landlock is deprecated\n"
+    assert failure_code(warning + "The model is not supported when using Codex with a ChatGPT account.") == "chatgpt_model_unavailable"
+    assert failure_code(warning + "turn.failed invalid_json_schema") == "output_schema_rejected"
+    assert failure_code(warning + "turn.failed 401 unauthorized") == "provider_auth_failed"
+    assert failure_code(warning + "turn.failed unrelated service failure") == "runtime_or_provider_failed"
+    assert failure_code("failed to apply Landlock") == "landlock_unavailable"
+    assert failure_code("Error loading config.toml: reserved built-in provider IDs") == "runtime_config_invalid"
 
 
 def test_provider_references_and_missing_models(configured, monkeypatch):
@@ -281,6 +332,43 @@ def test_codex_hypotheses_persist_the_actual_backend(configured, tmp_path, monke
     assert "codex" in report and "OpenCode" not in report
     trace = (orchestrator.artifact_root / run_id / "reasoning.json").read_text()
     assert json.loads(trace)["backend"] == "codex" and "dummy-secret-key" not in trace
+
+
+def test_cli_chatgpt_override_persists_auth_mode_and_preserves_defaults(configured, tmp_path, monkeypatch):
+    executable, _ = configured
+    from run_scientist import ROOT
+    settings_path = ROOT / "config/models.yaml"
+    original_settings = settings_path.read_bytes()
+    fake_popen(monkeypatch, json.dumps(batch()))
+    output = tmp_path / "artifacts"
+    assert main(["--generate-hypotheses", "--backend", "codex", "--codex-auth", "chatgpt",
+                 "--model", "gpt-6.1-sol", "--codex-bin", str(executable),
+                 "--output-dir", str(output), "--database", str(tmp_path / "research.sqlite3")]) == 0
+    trace = json.loads(next(output.glob("run_*/reasoning.json")).read_text())
+    runtime = trace["attempts"][0]["runtime"]
+    assert runtime["auth_mode"] == "chatgpt" and runtime["provider"] == "openai"
+    assert runtime["model"] == "gpt-6.1-sol"
+    assert settings_path.read_bytes() == original_settings
+
+
+def test_auth_modes_select_independent_runtime_settings(configured, tmp_path):
+    legacy, config_path = configured
+    modern = tmp_path / "modern-codex"
+    modern.write_text("fixture")
+    modern.chmod(0o755)
+    config = ReasoningConfig(backend="codex", model="test/model", config=str(config_path),
+                             codex_executable=str(legacy), codex_sandbox_backend="landlock",
+                             codex_chatgpt_executable=str(modern), codex_chatgpt_sandbox_backend="default")
+    gateway = make_reasoning_backend(config)
+    official_config = config.model_copy(update={"codex_auth_mode": "chatgpt", "model": "gpt-6.1-sol",
+                                                "codex_reasoning_effort": "high"})
+    official = make_reasoning_backend(official_config, role="problem_clarification")
+    assert gateway.executable == str(legacy) and gateway.sandbox_backend == "landlock"
+    assert official.executable == str(modern) and official.sandbox_backend == "default"
+    assert official.model == "gpt-6.1-sol" and official.reasoning_effort == "high"
+    fallback = make_reasoning_backend(official_config.model_copy(update={"codex_chatgpt_executable": None,
+                                                                        "codex_chatgpt_sandbox_backend": None}))
+    assert fallback.executable == str(legacy) and fallback.sandbox_backend == "landlock"
 
 
 def test_failure_diagnoses_are_distinct_and_cli_does_not_use_backend_flags_in_demo():

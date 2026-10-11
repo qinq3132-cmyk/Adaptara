@@ -34,7 +34,7 @@ class ReasoningBackend(Protocol):
 
 def hypothesis_context(state: ScientificState) -> dict:
     """Use recorded evidence/metrics, not entire raw trajectories or credentials."""
-    return {"question": state.question.model_dump(mode="json"),
+    context = {"question": state.question.model_dump(mode="json"),
             "knowledge": [c.model_dump(mode="json") for c in state.knowledge],
             "existing_hypotheses": [h.model_dump(mode="json") for h in state.hypotheses],
             "evidence": [e.model_dump(mode="json") for e in state.evidence],
@@ -44,6 +44,13 @@ def hypothesis_context(state: ScientificState) -> dict:
             "analyses": [a.model_dump(mode="json") for a in state.analyses],
             "critiques": [c.model_dump(mode="json") for c in state.critiques],
             "open_questions": [q.model_dump(mode="json") for q in state.open_questions]}
+    if state.problem_definition is not None:
+        context["problem_definition"] = state.problem_definition.model_dump(mode="json")
+    if state.schema_version >= 3:
+        context["papers"] = [p.model_dump(mode="json") for p in state.papers]
+        context["literature"] = state.literature.model_dump(mode="json") if state.literature else None
+        context["hypothesis_reviews"] = [r.model_dump(mode="json") for r in state.hypothesis_reviews]
+    return context
 
 
 def normalized(text: str) -> str:
@@ -123,8 +130,12 @@ class LLMHypothesisAgent:
             claim, mechanism = normalized(draft.claim), normalized(draft.mechanism)
             if claim in claims or claim in prior_claims or mechanism in mechanisms:
                 raise ValueError("Duplicate hypothesis claim or mechanism")
-            if set(draft.parent_hypotheses) - existing_hypotheses or set(draft.source_claims) - source_claims:
-                raise ValueError("Unknown scientific source reference")
+            if set(draft.parent_hypotheses) - existing_hypotheses:
+                raise ValueError(f"Unknown parent_hypotheses; allowed hypothesis IDs: {sorted(existing_hypotheses)}")
+            if set(draft.source_claims) - source_claims:
+                raise ValueError(f"Unknown source_claims; use knowledge[].id only, not evidence or paper IDs. Allowed claim IDs: {sorted(source_claims)}")
+            if state.literature is not None and source_claims and not draft.source_claims:
+                raise ValueError("Literature-grounded proposals must cite supplied claims")
             for text in (draft.claim, draft.mechanism, *draft.assumptions, *draft.predictions,
                          *draft.alternative_explanations, *draft.falsification_conditions):
                 if not text.strip():

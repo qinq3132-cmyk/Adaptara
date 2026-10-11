@@ -25,7 +25,9 @@ class ReasoningConfig(Record):
     hypothesis_count: int = Field(default=3, ge=3, le=6)
     validation_retries: int = Field(default=1, ge=0, le=2)
     codex_executable: str | None = None
-    codex_auth_mode: Literal["opencode", "codex"] = "opencode"
+    codex_chatgpt_executable: str | None = None
+    codex_chatgpt_sandbox_backend: Literal["default", "landlock"] | None = None
+    codex_auth_mode: Literal["opencode", "codex", "chatgpt"] = "opencode"
     codex_credential_provider: str | None = None
     codex_base_url: str | None = None
     codex_provider_id: str = "OpenAI"
@@ -35,14 +37,18 @@ class ReasoningConfig(Record):
     codex_reasoning_summary: Literal["auto", "concise", "detailed", "none"] | None = None
 
 
-def make_reasoning_backend(config: ReasoningConfig):
+def make_reasoning_backend(config: ReasoningConfig, *, role: str = "hypothesis"):
     common = dict(model=config.model, config=Path(config.config) if config.config else None,
-                  timeout_seconds=config.timeout_seconds, proxy_env_precedence=config.proxy_env_precedence)
+                  timeout_seconds=config.timeout_seconds, proxy_env_precedence=config.proxy_env_precedence,
+                  role=role)
     if config.backend == "codex":
-        return CodexBackend(**common, executable=config.codex_executable, auth_mode=config.codex_auth_mode,
+        chatgpt = config.codex_auth_mode == "chatgpt"
+        executable = (config.codex_chatgpt_executable or config.codex_executable) if chatgpt else config.codex_executable
+        sandbox_backend = (config.codex_chatgpt_sandbox_backend or config.codex_sandbox_backend) if chatgpt else config.codex_sandbox_backend
+        return CodexBackend(**common, executable=executable, auth_mode=config.codex_auth_mode,
                             base_url=config.codex_base_url, provider_id=config.codex_provider_id,
                             credential_provider=config.codex_credential_provider,
-                            sandbox_backend=config.codex_sandbox_backend,
+                            sandbox_backend=sandbox_backend,
                             model_catalog=Path(config.codex_model_catalog) if config.codex_model_catalog else None,
                             reasoning_effort=config.codex_reasoning_effort, reasoning_summary=config.codex_reasoning_summary)
     return OpenCodeBackend(**common, executable=config.executable)
@@ -53,10 +59,11 @@ def make_hypothesis_agent(config: ReasoningConfig) -> LLMHypothesisAgent:
     return LLMHypothesisAgent(backend, count=config.hypothesis_count, max_retries=config.validation_retries)
 
 
-def hypothesis_report(output: HypothesisOutput, model: str, backend: str = "opencode") -> str:
+def hypothesis_report(output: HypothesisOutput, model: str, backend: str = "opencode", *, reviewed=False) -> str:
     lines = ["# 模型生成的候选假设", "", f"执行后端：{backend}；请求模型：`{model}`。", "",
              "所有假设均为 proposed；0.5 是统一初始化的内部信念分数，不是模型给出的概率。", "",
-             "本次仅生成和校验候选，尚未执行实验或科学批判，也未验证假设正确性。", ""]
+             ("包含实验前假设审查与修订；尚未执行实验，评审不代表假设成立。" if reviewed else
+              "本次仅生成和校验候选，尚未执行实验或科学批判，也未验证假设正确性。"), ""]
     for h in output.hypotheses:
         lines += [f"## {h.id}", "", h.claim, "", f"机制：{h.mechanism}", ""]
         for label, values in (("假设条件", h.assumptions), ("预测", h.predictions),
@@ -104,6 +111,8 @@ def generate_hypotheses(*, state: ScientificState, agent: LLMHypothesisAgent,
                                   "source_sha256": hashlib.sha256(json_bytes(sources)).hexdigest()},
                "report.md": hypothesis_report(output, model, backend).encode("utf-8")}
     directory = artifact_root / run_id
+    if final.problem_definition is not None:
+        exports["problem_definition.json"] = final.problem_definition.model_dump(mode="json")
     store.save(run_id, final, directory, exports)
     store.verify_artifacts(run_id)
     for h in output.hypotheses:

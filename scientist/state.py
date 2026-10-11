@@ -1,7 +1,10 @@
 """The sole scientific state, with referential integrity at every commit."""
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
+
+from .problem_schemas import ConfirmedProblem
+from .literature_schemas import LiteratureOverview, HypothesisReviewRecord
 
 from .schemas import (
     Analysis, Claim, Critique, Decision, Evidence, Experiment, ExperimentResult,
@@ -11,8 +14,9 @@ from .schemas import (
 
 
 class ScientificState(Record):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2, 3] = 1
     question: ScientificQuestion
+    problem_definition: ConfirmedProblem | None = None
     knowledge: tuple[Claim, ...] = ()
     papers: tuple[Paper, ...] = ()
     hypotheses: tuple[Hypothesis, ...] = ()
@@ -24,15 +28,35 @@ class ScientificState(Record):
     critiques: tuple[Critique, ...] = ()
     theory_updates: tuple[TheoryUpdate, ...] = ()
     decisions: tuple[Decision, ...] = ()
+    literature: LiteratureOverview | None = None
+    hypothesis_reviews: tuple[HypothesisReviewRecord, ...] = ()
     current_round: int = Field(default=0, ge=0)
     stage: Stage = Stage.QUESTION
     budget: ResearchBudget = Field(default_factory=ResearchBudget)
 
+    @model_serializer(mode="wrap")
+    def serialize_version(self, handler):
+        data = handler(self)
+        if self.schema_version == 1:
+            # Preserve the original closed v1 wire contract for old readers.
+            data.pop("problem_definition", None)
+        if self.schema_version < 3:
+            data.pop("literature", None)
+            data.pop("hypothesis_reviews", None)
+        return data
+
     @model_validator(mode="after")
     def references_exist(self):
+        if self.schema_version == 1 and self.problem_definition is not None:
+            raise ValueError("Problem definitions require scientific state schema version 2")
+        if self.schema_version < 3 and (self.literature is not None or self.hypothesis_reviews):
+            raise ValueError("Literature and hypothesis review require state schema version 3")
+        if self.schema_version >= 2:
+            if self.problem_definition is None or self.question != self.problem_definition.question:
+                raise ValueError("Version 2 requires a matching confirmed problem definition")
         collections = (self.papers, self.knowledge, self.hypotheses, self.experiments,
                        self.results, self.evidence, self.open_questions, self.analyses,
-                       self.critiques, self.theory_updates, self.decisions)
+                       self.critiques, self.theory_updates, self.decisions, self.hypothesis_reviews)
         all_ids = [self.question.id] + [item.id for group in collections for item in group]
         if len(all_ids) != len(set(all_ids)):
             raise ValueError("Record IDs must be globally unique")
@@ -66,6 +90,26 @@ class ScientificState(Record):
                 r.experiment_id == evidence.source_id for r in self.results
             ):
                 raise ValueError("Experimental evidence requires a recorded result")
+            if evidence.verification is not None:
+                if evidence.source_type != "paper" or not evidence.quote or not evidence.locator or not evidence.content_sha256:
+                    raise ValueError("Verified literature evidence requires quote, locator and content hash")
+                paper = next(p for p in self.papers if p.id == evidence.source_id)
+                if paper.content_sha256 != evidence.content_sha256 or paper.read_level is None:
+                    raise ValueError("Literature evidence differs from its paper snapshot")
+        if self.literature is not None:
+            for item in self.literature.gaps + self.literature.conflicts:
+                require(item.evidence_ids, self.evidence, "literature observations")
+        for review in self.hypothesis_reviews:
+            ids = [r.hypothesis_id for r in review.batch.reviews]
+            if len(ids) != len(set(ids)) or set(review.batch.ranking) != set(ids) or len(review.batch.ranking) != len(ids):
+                raise ValueError("Hypothesis review must rank each reviewed hypothesis once")
+            require(ids, self.hypotheses, "reviewed hypotheses")
+            for item in review.batch.reviews:
+                require(item.evidence_ids, self.evidence, "review evidence")
+                require(item.closest_paper_ids, self.papers, "review papers")
+            for comparison in review.batch.comparisons:
+                if set(comparison.predictions) - set(ids):
+                    raise ValueError("Comparison refers to an unreviewed hypothesis")
         for analysis in self.analyses:
             require(analysis.result_ids, self.results, "analysis results")
         for critique in self.critiques:

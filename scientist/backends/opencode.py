@@ -8,7 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .common import BackendError, ReasoningResponse
+from .common import BackendError, ReasoningResponse, TOOL_FREE_ROLES
 
 
 def locate_opencode(executable: str | None = None) -> str:
@@ -47,7 +47,7 @@ def parse_events(output: str) -> ReasoningResponse:
             # Providers may include keys/headers in errors; never echo them.
             raise BackendError("OpenCode reported a runtime or provider error")
         if kind == "tool_use":
-            raise BackendError("Hypothesis generation unexpectedly attempted a tool call")
+            raise BackendError("Scientific reasoning unexpectedly attempted a tool call")
         session = event.get("sessionID")
         if session:
             sessions.add(session)
@@ -71,12 +71,13 @@ def parse_events(output: str) -> ReasoningResponse:
 class OpenCodeBackend:
     """Each call creates a fresh role session, with no shell/edit/delegation tools.
 
-    This adapter covers hypothesis generation only. Literature/code roles need
+    This adapter covers tool-free scientific reasoning. Literature/code roles need
     separate, explicit tool configurations. Provider auth stays in OpenCode.
     """
     name = "opencode"
     def __init__(self, *, model: str, executable: str | None = None,
-                 config: Path | None = None, timeout_seconds: float = 180, proxy_env_precedence: str = "inherit"):
+                 config: Path | None = None, timeout_seconds: float = 180, proxy_env_precedence: str = "inherit",
+                 role: str = "hypothesis"):
         if "/" not in model or not all(model.split("/", 1)):
             raise ValueError("Model must use the OpenCode provider/model format")
         if not 0 < timeout_seconds <= 600:
@@ -90,17 +91,21 @@ class OpenCodeBackend:
             raise ValueError("Proxy environment precedence must be inherit or uppercase")
         self.timeout_seconds = timeout_seconds
         self.proxy_env_precedence = proxy_env_precedence
+        if role not in TOOL_FREE_ROLES:
+            raise ValueError("Unsupported tool-free scientific role")
+        self.role = role
 
     def complete(self, *, instructions: str, prompt: str) -> ReasoningResponse:
         started = time.monotonic()
-        with tempfile.TemporaryDirectory(prefix="scientist-hypothesis-") as folder:
+        with tempfile.TemporaryDirectory(prefix=f"scientist-{self.role}-") as folder:
             workdir = Path(folder)
-            role = {"description": "Generate falsifiable competing scientific hypotheses",
+            role = {"description": ("Generate falsifiable competing scientific hypotheses" if self.role == "hypothesis"
+                                    else "Perform a structured, tool-free scientific reasoning role"),
                     "mode": "primary", "prompt": instructions,
                     "permission": {"*": "deny"}, "steps": 2}
             # A one-step limit makes OpenCode append an assistant summary hint.
             # Some compatible models reject that as unsupported prefill.
-            runtime_config = {"agent": {"hypothesis": role}, "share": "disabled", "autoupdate": False}
+            runtime_config = {"agent": {self.role: role}, "share": "disabled", "autoupdate": False}
             env = dict(os.environ)
             if self.proxy_env_precedence == "uppercase":
                 for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
@@ -113,13 +118,14 @@ class OpenCodeBackend:
                         "OPENCODE_DISABLE_MODELS_FETCH": "true"})
             if self.config:
                 env["OPENCODE_CONFIG"] = str(self.config)
-            command = [self.executable, "run", "--pure", "--format", "json", "--agent", "hypothesis",
-                       "--model", self.model, "--title", "Autonomous Scientist hypotheses", "--dir", str(workdir), prompt]
+            title = "Autonomous Scientist hypotheses" if self.role == "hypothesis" else "Autonomous Scientist problem clarification"
+            command = [self.executable, "run", "--pure", "--format", "json", "--agent", self.role,
+                       "--model", self.model, "--title", title, "--dir", str(workdir), prompt]
             try:
                 process = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
                                          env=env, cwd=workdir, timeout=self.timeout_seconds, check=False)
             except subprocess.TimeoutExpired:
-                raise BackendError("OpenCode hypothesis generation timed out") from None
+                raise BackendError("OpenCode scientific reasoning timed out") from None
             except OSError:
                 raise BackendError("OpenCode could not be started") from None
             if process.returncode:
@@ -127,6 +133,6 @@ class OpenCodeBackend:
             response = parse_events(process.stdout)
         return ReasoningResponse(response.text, {**response.metadata, "backend": "opencode",
                                                  "model": self.model, "elapsed_seconds": time.monotonic() - started,
-                                                 "role": "hypothesis", "executable": self.executable,
+                                                 "role": self.role, "executable": self.executable,
                                                  "proxy_env_precedence": self.proxy_env_precedence,
                                                  "tool_permissions": {"*": "deny"}})
