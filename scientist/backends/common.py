@@ -3,7 +3,8 @@ from dataclasses import dataclass
 
 TOOL_FREE_ROLES = {"hypothesis", "problem_clarification", "problem_synthesis", "literature_search",
                    "literature_screening", "literature_reading", "evidence_verification",
-                   "literature_synthesis", "hypothesis_review", "hypothesis_revision"}
+                   "literature_synthesis", "hypothesis_review", "hypothesis_revision", "experiment_design",
+                   "experiment_implementation_review", "experiment_result_analysis"}
 
 
 @dataclass(frozen=True)

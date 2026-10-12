@@ -1,0 +1,4 @@
+# Reproducible exploratory pilot designs; these seeds do not establish statistical power.
+max_candidates: 2
+max_target_hypotheses: 3
+seeds: [7, 11, 19]

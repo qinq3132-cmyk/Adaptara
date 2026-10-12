@@ -59,9 +59,10 @@ class HypothesisPipeline:
                         self.literature.artifact_root / "research_agent_cache", emit=self.literature.emit)
         else:
             agent = self.literature.agent(cls)
-        result = agent.run(inputs, validate)
-        self.attempts.extend(agent.attempts)
-        return result
+        try:
+            return agent.run(inputs, validate)
+        finally:
+            self.attempts.extend(agent.attempts)
 
     def generate(self, state):
         if state.literature is None or not state.knowledge or not state.evidence:
@@ -88,6 +89,8 @@ class HypothesisPipeline:
             if set(batch.ranking) != set(targets) or len(batch.ranking) != len(targets):
                 raise ValueError("Review ranking must contain each target once")
             for item in batch.reviews:
+                if item.verdict == 'ready' and item.revision_requests:
+                    raise ValueError('A ready verdict cannot retain mandatory revision requests; use revise or resolve them')
                 if set(item.evidence_ids) - known_evidence or set(item.closest_paper_ids) - known_papers:
                     raise ValueError("Review cites unknown evidence or paper")
             if batch.search_requests and not search_available:
@@ -119,7 +122,9 @@ class HypothesisPipeline:
                 if len(draft.parent_hypotheses) != 1 or draft.parent_hypotheses[0] not in targets:
                     raise ValueError("Revision requires exactly its target parent ID")
                 if not draft.source_claims or set(draft.source_claims) - claims:
-                    raise ValueError("Revision must cite known literature claims")
+                    invalid = sorted(set(draft.source_claims) - claims)
+                    raise ValueError(f"source_claims must cite literature CLAIM IDs, not evidence IDs. Invalid IDs: {invalid}. "
+                                     f"Allowed source_claim_ids: {sorted(claims)}")
                 text, mechanism = normalized(draft.claim), normalized(draft.mechanism)
                 if text in texts or mechanism in mechanisms:
                     raise ValueError("Revised candidates must have distinct claims and mechanisms")
@@ -132,6 +137,7 @@ class HypothesisPipeline:
             if set(parents) != set(targets) or len(set(parents)) != len(parents):
                 raise ValueError("Revision must preserve a one-to-one parent mapping")
         batch = self.call(HypothesisRevisionAgent, {"scientific_context": hypothesis_context(state),
+                         "allowed_source_claim_ids": sorted(claims),
                          "targets": [existing[t].model_dump(mode="json") for t in targets],
                          "review": review.model_dump(mode="json")}, validate)
         ids = allocate_ids(state, len(targets))

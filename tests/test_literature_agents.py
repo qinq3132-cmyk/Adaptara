@@ -106,7 +106,7 @@ class FixtureFactory:
             items = [{"hypothesis_id": hid, "verdict": "revise" if self.revise and first and i == 1 else "ready",
                       "evidence_ids": [context["evidence"][0]["id"]], "closest_paper_ids": ["P_test"],
                       "novelty": "uncertain", "rationale": "Evidence grounds premises, not the new hypothesis",
-                      "issues": ["Define the intervention"], "revision_requests": ["Clarify an intervention"] if i == 1 else [],
+                      "issues": ["Define the intervention"], "revision_requests": ["Clarify an intervention"] if self.revise and first and i == 1 else [],
                       "human_summary": "需要实验区分该机制。", "recommended_test": "控制相同变化，比较干预后的恢复。"}
                      for i, hid in enumerate(ids)]
             return {"reviews": items, "comparisons": [{"condition": "Same change and controlled intervention",
@@ -380,6 +380,39 @@ def test_revision_budget_does_not_turn_unresolved_candidates_ready(setup):
     assert len(final.hypotheses) == 3
     assert final.hypothesis_reviews[-1].batch.reviews[1].verdict == "revise"
     assert hp.exports["review_budget.json"]["remaining_revision_requests"] == ["H002"]
+
+
+def test_ready_verdict_with_mandatory_changes_is_rejected(setup):
+    store, pipeline, factory = setup
+    state = run_literature(setup)
+    def contradictory_review(role, data, inputs):
+        if role == 'hypothesis_review':
+            data['reviews'][0].update(verdict='ready', revision_requests=['Close the contradictory state transition'])
+    factory.mutate = contradictory_review
+    hp = HypothesisPipeline(pipeline)
+    with pytest.raises(ValueError, match='failed validation'):
+        hp.run(state, store=store, source_root=ROOT, artifact_root=pipeline.artifact_root)
+    assert not state.hypothesis_reviews
+    assert 'ready verdict cannot retain mandatory' in hp.attempts[-1]['validation_error']
+
+
+def test_retry_can_correct_contradictory_ready_to_an_actionable_revision(setup):
+    store, pipeline, factory = setup
+    state = run_literature(setup)
+    pipeline.common = pipeline.common.model_copy(update={'validation_retries': 1})
+    pipeline.config = pipeline.config.model_copy(update={'max_revision_rounds': 0})
+    def contradictory_first(role, data, inputs):
+        if role == 'hypothesis_review':
+            first = sum(r == role for r, _ in factory.calls) == 1
+            data['reviews'][0].update(verdict='ready' if first else 'revise',
+                                    revision_requests=['Close the contradictory state transition'])
+    factory.mutate = contradictory_first
+    hp = HypothesisPipeline(pipeline)
+    final = hp.run(state, store=store, source_root=ROOT, artifact_root=pipeline.artifact_root)
+    assert final.hypothesis_reviews[-1].batch.reviews[0].verdict == 'revise'
+    assert hp.exports['review_budget.json']['remaining_revision_requests'] == ['H001']
+    attempts = [a for a in hp.attempts if a['role'] == 'hypothesis_review']
+    assert len(attempts) == 2 and not attempts[0]['accepted'] and attempts[1]['accepted']
 
 
 def test_review_existing_candidates_preserves_history_and_advances_round(setup):

@@ -48,6 +48,7 @@ def main(argv=None) -> int:
     mode.add_argument("--generate-hypotheses", action="store_true", help="Generate model-authored hypotheses without running an experiment")
     mode.add_argument("--research-literature", action="store_true", help="Research literature for a confirmed problem and save a grounded state")
     mode.add_argument("--review-hypotheses", action="store_true", help="Review and revise existing literature-grounded hypotheses")
+    mode.add_argument("--design-experiments", action="store_true", help="Design proposals for latest ready hypotheses without executing experiments")
     mode.add_argument("--research", action="store_true", help="Run literature research, hypothesis generation, review and bounded revision")
     mode.add_argument("--check-backend", action="store_true", help="Check Codex structured output, sandbox and file tools")
     mode.add_argument("--read-document", type=Path, help="Read a local UTF-8 .txt/.md through Codex")
@@ -74,6 +75,7 @@ def main(argv=None) -> int:
     parser.add_argument("--database", type=Path, default=ROOT / "database/research.sqlite3")
     parser.add_argument("--config-dir", type=Path, default=ROOT / "config")
     parser.add_argument("--literature-config", type=Path, help="Literature agent/model and acquisition budget configuration")
+    parser.add_argument("--literature-discovery", type=Path, help="Resume a checksummed screening checkpoint without repeating search")
     args = parser.parse_args(argv)
     if args.parent_run and not args.followup:
         parser.error("--parent-run requires --followup E002")
@@ -88,7 +90,7 @@ def main(argv=None) -> int:
         parser.error("--feedback-file requires --review-question")
     if args.confirmed_by and not args.confirm_question:
         parser.error("--confirmed-by requires --confirm-question")
-    literature_mode = args.research_literature or args.research or args.review_hypotheses
+    literature_mode = args.research_literature or args.research or args.review_hypotheses or args.design_experiments
     state_mode = args.generate_hypotheses or literature_mode
     if args.confirmed_question and (not (args.generate_hypotheses or args.research_literature or args.research) or args.state_file):
         parser.error("--confirmed-question requires literature/hypothesis generation and cannot be combined with --state-file")
@@ -96,8 +98,12 @@ def main(argv=None) -> int:
         parser.error("Literature research requires --confirmed-question or --state-file")
     if args.review_hypotheses and not args.state_file:
         parser.error("--review-hypotheses requires --state-file")
+    if args.design_experiments and not args.state_file:
+        parser.error("--design-experiments requires --state-file")
     if args.literature_config and not literature_mode:
         parser.error("--literature-config requires a literature/review research mode")
+    if args.literature_discovery and not (args.research_literature or args.research):
+        parser.error("--literature-discovery requires --research-literature or --research")
     reasoning_mode = (args.generate_hypotheses or args.check_backend or args.read_document
                       or args.clarify_question or args.review_question or literature_mode)
     if any((args.backend, args.model, args.codex_bin, args.codex_auth, args.opencode_bin, args.opencode_config)) and not reasoning_mode:
@@ -205,9 +211,20 @@ def main(argv=None) -> int:
                 settings = LiteratureConfig.model_validate(yaml.safe_load(literature_path.read_text(encoding="utf-8")))
                 pipeline = LiteraturePipeline(reasoning, settings, args.output_dir, backend_factory=make_reasoning_backend)
                 store = ResearchStore(args.database)
+                if args.design_experiments:
+                    from scientist.experiment_design import ExperimentDesignConfig, design_experiments
+                    design_path = args.config_dir / 'experiment_design.yaml'
+                    design_config = ExperimentDesignConfig.model_validate(
+                        yaml.safe_load(design_path.read_text(encoding='utf-8')) if design_path.exists() else {})
+                    design_experiments(state=state, pipeline=pipeline, config=design_config, store=store,
+                                       source_root=ROOT, artifact_root=args.output_dir)
+                    return 0
+                if args.literature_discovery and state.literature is not None and not args.research_literature:
+                    raise ValueError("A discovery checkpoint requires a state before literature synthesis")
                 if args.research_literature or (args.research and state.literature is None):
                     state = research_literature(state=state, pipeline=pipeline, store=store,
-                                               source_root=ROOT, artifact_root=args.output_dir)
+                                               source_root=ROOT, artifact_root=args.output_dir,
+                                               discovery_checkpoint=args.literature_discovery)
                 if args.research or args.review_hypotheses:
                     reviewed_hypotheses(state=state, pipeline=HypothesisPipeline(pipeline), store=store,
                                        source_root=ROOT, artifact_root=args.output_dir, generate=not args.review_hypotheses)

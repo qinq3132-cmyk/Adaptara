@@ -7,6 +7,7 @@ from .problem_schemas import ProblemText
 from .schemas import Record, Text
 
 LiteratureProvider = Literal["semantic_scholar", "arxiv", "crossref", "europe_pmc", "openalex"]
+CoverageCategory = Literal["direct", "theory", "boundary", "cross_discipline"]
 
 
 class SearchQuery(Record):
@@ -43,6 +44,9 @@ class SelectionItem(Record):
     paper_id: ProblemText
     selected: StrictBool
     reason: ProblemText
+    category: Literal["direct", "theory", "boundary", "cross_discipline", "uncertain", "unrelated"] = "uncertain"
+    priority: int = Field(default=3, ge=0, le=5)
+    needs_metadata: StrictBool = False
 
 
 class PaperSelection(Record):

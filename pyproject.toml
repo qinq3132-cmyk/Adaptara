@@ -12,6 +12,7 @@ dependencies = ["pydantic>=2.10,<3", "PyYAML>=6,<7"]
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
 literature = ["pypdf>=5,<7"]
+learned-validation = ["numpy>=1.26,<3", "scipy>=1.11,<2", "torch>=2.2,<3"]
 
 [tool.setuptools.packages.find]
 include = ["scientist*", "experiments*", "environments*", "algorithms*"]

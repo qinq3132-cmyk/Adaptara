@@ -118,6 +118,10 @@ def candidate_id(title: str) -> str:
     return "P_" + hashlib.sha256(normalize(title).casefold().encode()).hexdigest()[:16]
 
 
+def normalized_doi(value):
+    return re.sub(r"^https?://(?:dx\.)?doi\.org/", "", value or "", flags=re.IGNORECASE).strip().casefold()
+
+
 def arxiv_parts(value: str | None) -> tuple[str | None, str | None]:
     if not value:
         return None, None
@@ -233,8 +237,10 @@ class LiteratureTools:
         self.resolve_open_access = resolve_open_access
         self.events = []
         self.unavailable_providers = {}
+        self.next_page = None
 
-    def search(self, queries: tuple[SearchQuery, ...], providers: tuple[str, ...], *, per_query=5, max_candidates=15):
+    def search(self, queries: tuple[SearchQuery, ...], providers: tuple[str, ...], *, per_query=5, max_candidates=15,
+               max_pages=1, exclude_ids=()):
         found = []
         for query in queries:
             chosen_providers = query.providers or providers
@@ -245,18 +251,37 @@ class LiteratureTools:
                     self.events.append({"operation": "search", "provider": provider, "query": query.text,
                                         "status": "skipped", "error": self.unavailable_providers[provider]})
                     continue
-                try:
-                    candidates = self._search(query, provider, per_query)
-                    found.extend(candidates)
-                    self.events.append({"operation": "search", "provider": provider, "query": query.text,
-                                        "returned": len(candidates), "status": "ok"})
-                except RuntimeError as error:
-                    if "status 429" in str(error) or "status 403" in str(error):
-                        self.unavailable_providers[provider] = "Provider rate-limited or denied access for this search run"
-                    self.events.append({"operation": "search", "provider": provider, "query": query.text,
-                                        "status": "failed", "error": str(error)})
+                seen, offset, cursor = set(), 0, None
+                for page in range(max_pages):
+                    try:
+                        self.next_page = None
+                        candidates = (self._search(query, provider, per_query) if page == 0 else
+                                      self._search(query, provider, per_query, offset=offset, cursor=cursor))
+                        found.extend(candidates)
+                        ids = {c.id for c in candidates}
+                        new_ids = ids - seen
+                        seen.update(ids)
+                        self.events.append({"operation": "search", "provider": provider, "query": query.text,
+                                            "returned": len(candidates), "new_records": len(new_ids), "page": page + 1, "status": "ok"})
+                        if not candidates or not new_ids:
+                            break
+                        if self.next_page is None:
+                            if len(candidates) < per_query:
+                                break
+                            offset += per_query
+                        else:
+                            if self.next_page.get("exhausted"):
+                                break
+                            offset = self.next_page.get("offset", offset + per_query)
+                            cursor = self.next_page.get("cursor")
+                    except RuntimeError as error:
+                        if "status 429" in str(error) or "status 403" in str(error):
+                            self.unavailable_providers[provider] = "Provider rate-limited or denied access for this search run"
+                        self.events.append({"operation": "search", "provider": provider, "query": query.text,
+                                            "page": page + 1, "status": "failed", "error": str(error)})
+                        break
         # Round-robin query coverage avoids letting the first query fill the budget.
-        unique = deduplicate(found)
+        unique = [p for p in deduplicate(found) if p.id not in exclude_ids]
         ordered = []
         pools = [[c for c in unique if q.text in c.query_texts and p in c.providers] for q in queries for p in providers]
         for n in range(max((len(p) for p in pools), default=0)):
@@ -265,17 +290,26 @@ class LiteratureTools:
                     ordered.append(pool[n])
         return ordered[:max_candidates]
 
-    def _search(self, query, provider, count):
+    def _search(self, query, provider, count, *, offset=0, cursor=None):
         if provider == "europe_pmc":
-            params = {"query": query.text, "format": "json", "resultType": "core", "pageSize": count}
+            params = {"query": query.text, "format": "json", "resultType": "core", "pageSize": count,
+                      "cursorMark": cursor or "*"}
             data, _ = self.http.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search?" + urlencode(params))
-            return self._europe_pmc_records(data, query.text)
+            records = self._europe_pmc_records(data, query.text)
+            next_cursor = json.loads(data).get("nextCursorMark")
+            if next_cursor is not None and not isinstance(next_cursor, str):
+                raise RuntimeError("Europe PMC returned an invalid pagination cursor")
+            self.next_page = {"cursor": next_cursor, "exhausted": not next_cursor or next_cursor == (cursor or "*")}
+            return records
         if provider == "openalex":
             params = {"search": query.text, "per_page": count}
+            if offset:
+                params["page"] = offset // count + 1
             headers = {"Authorization": "Bearer " + os.environ["OPENALEX_API_KEY"]} if os.environ.get("OPENALEX_API_KEY") else {}
             data, _ = self.http.get("https://api.openalex.org/works?" + urlencode(params), headers)
             try:
-                records = json.loads(data)["results"]
+                payload = json.loads(data)
+                records = payload["results"]
                 if not isinstance(records, list):
                     raise ValueError("Invalid results")
                 result = []
@@ -301,11 +335,16 @@ class LiteratureTools:
                         source_uri="https://doi.org/" + doi if doi else p["id"],
                         fulltext_uri=urls[0] if urls else None, fulltext_uris=urls,
                         providers=(provider,), query_texts=(query.text,)))
+                total = (payload.get("meta") or {}).get("count")
+                self.next_page = {"offset": offset + count, "exhausted": len(records) < count or
+                                  (isinstance(total, int) and offset + len(records) >= total)}
                 return result
             except (ValueError, KeyError, TypeError, AttributeError):
                 raise RuntimeError("OpenAlex returned invalid metadata records") from None
         if provider == "crossref":
             params = {"query.bibliographic": query.text, "rows": count}
+            if offset:
+                params["offset"] = offset
             data, _ = self.http.get("https://api.crossref.org/works?" + urlencode(params))
             try:
                 payload = json.loads(data)
@@ -334,12 +373,17 @@ class LiteratureTools:
                         source_uri="https://doi.org/" + doi, fulltext_uri=links[0] if links else None,
                         fulltext_uris=tuple(dict.fromkeys(links)),
                         providers=(provider,), query_texts=(query.text,)))
+                total = payload["message"].get("total-results")
+                self.next_page = {"offset": offset + count, "exhausted": len(items) < count or
+                                  (isinstance(total, int) and offset + len(items) >= total)}
                 return result
             except (ValueError, KeyError, TypeError, AttributeError):
                 raise RuntimeError("Crossref returned invalid metadata records") from None
         if provider == "semantic_scholar":
             params = {"query": query.text, "limit": count,
                       "fields": "title,abstract,authors,year,url,externalIds,openAccessPdf"}
+            if offset:
+                params["offset"] = offset
             headers = {"x-api-key": os.environ["SEMANTIC_SCHOLAR_API_KEY"]} if os.environ.get("SEMANTIC_SCHOLAR_API_KEY") else {}
             data, _ = self.http.get("https://api.semanticscholar.org/graph/v1/paper/search?" + urlencode(params), headers)
             try:
@@ -359,6 +403,8 @@ class LiteratureTools:
             except ValueError:
                 raise RuntimeError("Semantic Scholar returned an invalid metadata response") from None
             try:
+                next_offset = payload.get("next")
+                self.next_page = {"offset": next_offset, "exhausted": type(next_offset) is not int or next_offset <= offset}
                 return [PaperCandidate(id=candidate_id(p["title"]), title=p["title"], abstract=p.get("abstract") or "",
                             authors=tuple(a["name"] for a in p.get("authors", [])), year=p.get("year"),
                             doi=(p.get("externalIds") or {}).get("DOI"), arxiv_id=(p.get("externalIds") or {}).get("ArXiv"),
@@ -373,6 +419,8 @@ class LiteratureTools:
         tokens = re.findall(r'[\w-]+', query.text)
         expression = " AND ".join("all:" + t for t in tokens)
         params = {"search_query": expression, "max_results": count, "sortBy": "relevance"}
+        if offset:
+            params["start"] = offset
         data, _ = self.http.get("https://export.arxiv.org/api/query?" + urlencode(params))
         ns = {"a": "http://www.w3.org/2005/Atom", "x": "http://arxiv.org/schemas/atom"}
         try:
@@ -382,6 +430,11 @@ class LiteratureTools:
         if root.tag != "{http://www.w3.org/2005/Atom}feed":
             raise RuntimeError("arXiv response is not an Atom feed")
         result = []
+        entries = root.findall("a:entry", ns)
+        total_text = root.findtext("{http://a9.com/-/spec/opensearch/1.1/}totalResults")
+        total = int(total_text) if total_text and total_text.isdigit() else None
+        self.next_page = {"offset": offset + count, "exhausted": len(entries) < count or
+                          (total is not None and offset + len(entries) >= total)}
         for entry in root.findall("a:entry", ns):
             uri = entry.findtext("a:id", namespaces=ns)
             if not uri or "/abs/" not in uri:
@@ -433,6 +486,74 @@ class LiteratureTools:
             return result
         except (ValueError, KeyError, TypeError, AttributeError):
             raise RuntimeError("Europe PMC returned invalid metadata records") from None
+
+    def enrich_candidates(self, papers, providers, *, max_requests):
+        """Bounded exact-identifier lookups; never copy an abstract from a similar title."""
+        updated, used = [], 0
+        for paper in papers:
+            current = paper
+            for provider in ("europe_pmc", "openalex", "crossref"):
+                if current.abstract.strip() or used >= max_requests:
+                    break
+                if provider not in providers or provider in self.unavailable_providers:
+                    continue
+                if not current.doi and not (provider == "europe_pmc" and current.pmid):
+                    continue
+                used += 1
+                try:
+                    donor = self._metadata_lookup(current, provider)
+                    if donor is not None:
+                        # Match exact IDs, rejecting conflicting DOI records even if another ID agrees.
+                        if current.doi and donor.doi and normalized_doi(current.doi) != normalized_doi(donor.doi):
+                            raise ValueError("Metadata lookup returned a conflicting DOI")
+                        match = ((current.doi and donor.doi and normalized_doi(current.doi) == normalized_doi(donor.doi))
+                                 or (current.pmid and donor.pmid and current.pmid == donor.pmid))
+                        if not match:
+                            raise ValueError("Metadata lookup did not match the requested identifier")
+                        current = deduplicate([current, donor])[0]
+                    self.events.append({"operation": "metadata", "provider": provider, "paper_id": paper.id,
+                                        "status": "ok", "abstract_available": bool(current.abstract.strip())})
+                except (RuntimeError, ValueError, KeyError, TypeError, AttributeError) as error:
+                    if "status 429" in str(error) or "status 403" in str(error):
+                        self.unavailable_providers[provider] = "Provider rate-limited or denied access for this search run"
+                    self.events.append({"operation": "metadata", "provider": provider, "paper_id": paper.id,
+                                        "status": "failed", "error": str(error)})
+            updated.append(current)
+        return updated, used
+
+    def _metadata_lookup(self, paper, provider):
+        if provider == "europe_pmc":
+            expression = 'DOI:"' + normalized_doi(paper.doi) + '"' if paper.doi else 'EXT_ID:' + paper.pmid + ' AND SRC:MED'
+            params = {"query": expression, "format": "json", "resultType": "core", "pageSize": 1}
+            data, _ = self.http.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search?" + urlencode(params))
+            records = self._europe_pmc_records(data, "Metadata lookup")
+            return records[0] if records else None
+        if provider == "openalex":
+            headers = {"Authorization": "Bearer " + os.environ["OPENALEX_API_KEY"]} if os.environ.get("OPENALEX_API_KEY") else {}
+            data, _ = self.http.get("https://api.openalex.org/works/https://doi.org/" + quote(normalized_doi(paper.doi), safe="/"), headers)
+            record = json.loads(data)
+            positions = {int(index): word for word, indices in (record.get("abstract_inverted_index") or {}).items() for index in indices}
+            locations = [record.get("best_oa_location")] + (record.get("locations") or [])
+            urls = tuple(dict.fromkeys(url for location in locations if location and location.get("is_oa")
+                                      for url in (location.get("pdf_url"), location.get("landing_page_url")) if url))
+            identifiers = record.get("ids") or {}
+            return PaperCandidate(id=paper.id, title=paper.title, doi=record.get("doi"),
+                pmid=(identifiers.get("pmid") or "").rstrip("/").rsplit("/", 1)[-1] or None,
+                pmcid=(identifiers.get("pmcid") or "").rstrip("/").rsplit("/", 1)[-1] or None,
+                abstract=" ".join(positions[i] for i in sorted(positions)), source_uri=paper.source_uri,
+                fulltext_uri=urls[0] if urls else None, fulltext_uris=urls,
+                providers=(provider,), query_texts=paper.query_texts)
+        data, _ = self.http.get("https://api.crossref.org/works/" + quote(normalized_doi(paper.doi), safe=""))
+        record = json.loads(data)["message"]
+        parser = ArticleHTML()
+        parser.feed(record.get("abstract") or "")
+        parser.flush()
+        links = tuple(dict.fromkeys(v['URL'] for v in record.get('link', [])
+                                    if v.get('content-type') == 'application/pdf' and v.get('URL')))
+        return PaperCandidate(id=paper.id, title=paper.title, doi=record["DOI"],
+            abstract=" ".join(t for _, t in parser.blocks), source_uri=paper.source_uri,
+            fulltext_uri=links[0] if links else None, fulltext_uris=links,
+            providers=(provider,), query_texts=paper.query_texts)
 
     def _resolve_fulltext(self, paper):
         """Resolve only selected papers, keeping metadata and access failures separate."""

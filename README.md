@@ -10,6 +10,9 @@ After confirmation, `--research-literature` produces traceable papers, evidence 
 claims. `--research` connects this literature state to hypothesis generation,
 independent review and bounded revision. Each role has a separate prompt and
 configurable model; see [the literature and hypothesis agents](docs/literature_agents.md).
+`--design-experiments --state-file <reviewed-state.json>` creates model-authored,
+review-gated experiment proposals with controls, measurements and falsification criteria.
+This mode saves plans and a concise confirmation sheet without executing experiments.
 Install PDF reading support with `python -m pip install -e '.[literature]'`.
 
 The default demo runs one offline scientific cycle, with deterministic mock

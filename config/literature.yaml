@@ -1,13 +1,23 @@
-# Sequential scientific roles; all model calls are tool-free.
+# Scientific stages remain ordered; independent paper jobs may run concurrently.
 # Python executes search/download tools with bounded acquisition budgets.
 providers: [semantic_scholar, arxiv, crossref, europe_pmc, openalex]
-max_queries: 4
-results_per_query: 6
-max_candidates: 40
-max_selected_papers: 5
-min_candidates: 12
-min_selected_papers: 3
-max_search_rounds: 3
+max_queries: 6
+results_per_query: 10
+max_pages_per_query: 3
+max_candidates: 120
+max_candidates_per_round: 40
+max_selected_papers: 20
+reading_concurrency: 8
+min_candidates: 30
+min_selected_papers: 12
+max_search_rounds: 4
+min_search_rounds: 2
+required_categories: [direct, theory, boundary, cross_discipline]
+saturation_rounds: 1
+max_new_relevant_per_round: 2
+screening_batch_size: 30
+max_metadata_requests: 20
+http_retries: 2
 max_characters_per_paper: 36000
 allow_abstract: true
 resolve_open_access: true
@@ -15,14 +25,30 @@ http_timeout_seconds: 25
 max_revision_rounds: 1
 max_supplement_rounds: 1
 roles:
+  experiment_design:
+    model: glm-5.3
+    auth_mode: opencode
+    reasoning_effort: high
+    timeout_seconds: 600
+  literature_reading:
+    # Flash is configurable as glm-5.3-flash; retain GLM 5.3 after the pilot's math ambiguity.
+    model: glm-5.3
+    auth_mode: opencode
+    reasoning_effort: high
+    timeout_seconds: 300
   evidence_verification:
     model: glm-5.3
     auth_mode: opencode
     reasoning_effort: high
     timeout_seconds: 300
   hypothesis_review:
-    model: gpt-6.1-sol
-    auth_mode: chatgpt
+    model: glm-5.3
+    auth_mode: opencode
+    reasoning_effort: high
+    timeout_seconds: 600
+  hypothesis_revision:
+    model: glm-5.3
+    auth_mode: opencode
     reasoning_effort: high
     timeout_seconds: 600
   # Unlisted roles inherit config/models.yaml (currently GLM 5.3 high).
