@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from pydantic import Field, StrictBool, model_validator
 
+from .agents.llm_hypothesis import LIVE_ID
 from .agents.structured import StructuredAgent
 from .hypothesis_pipeline import load_source_documents
 from .provenance import capture_source, runtime_versions
@@ -131,7 +132,8 @@ class ExperimentDesignAgent(StructuredAgent):
 def ready_hypotheses(state):
     ancestors = {p for h in state.hypotheses for p in h.parent_hypotheses}
     latest = {r.hypothesis_id: r for record in state.hypothesis_reviews for r in record.batch.reviews}
-    return tuple(h for h in state.hypotheses if h.id not in ancestors and h.status == 'proposed'
+    return tuple(h for h in state.hypotheses if LIVE_ID.fullmatch(h.id)
+                 and h.id not in ancestors and h.status == 'proposed'
                  and h.id in latest and latest[h.id].verdict == 'ready')
 
 

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 from io import BytesIO
 from pathlib import Path
 
@@ -361,13 +362,18 @@ def test_revision_preserves_parent_and_prior_review_history(setup):
     factory.revise = True
     state = run_literature(setup)
     final = HypothesisPipeline(pipeline).run(state, store=store, source_root=ROOT, artifact_root=pipeline.artifact_root)
-    assert [h.id for h in final.hypotheses] == ["H001", "H002", "H003", "H004"]
-    assert final.hypotheses[-1].parent_hypotheses == ("H002",)
-    assert final.hypotheses[-1].claim == final.hypotheses[1].claim
+    # The revised family's slot passes to its successor; the retired parent becomes
+    # the first globally numbered history record HD001.
+    assert [h.id for h in final.hypotheses] == ["H001", "HD001", "H003", "H002"]
+    successor = final.hypotheses[-1]
+    assert successor.parent_hypotheses == ("HD001",)
+    assert successor.claim == final.hypotheses[1].claim
     assert len(final.hypothesis_reviews) == 2
     assert final.hypothesis_reviews[0].batch.reviews[1].verdict == "revise"
-    assert set(final.hypothesis_reviews[-1].batch.ranking) == {"H001", "H004", "H003"}
+    assert set(final.hypothesis_reviews[-1].batch.ranking) == {"H001", "H002", "H003"}
     assert all(h.status == "proposed" for h in final.hypotheses)
+    # The historical record still resolves the retired identifier everywhere.
+    assert final.hypothesis_reviews[0].batch.reviews[1].hypothesis_id == "HD001"
 
 
 def test_revision_budget_does_not_turn_unresolved_candidates_ready(setup):
@@ -380,6 +386,33 @@ def test_revision_budget_does_not_turn_unresolved_candidates_ready(setup):
     assert len(final.hypotheses) == 3
     assert final.hypothesis_reviews[-1].batch.reviews[1].verdict == "revise"
     assert hp.exports["review_budget.json"]["remaining_revision_requests"] == ["H002"]
+
+
+def test_retired_versions_move_to_hd_history_without_blocking_live_numbers(setup):
+    """Two revision rounds keep live IDs compact and retire old versions read-only."""
+    store, pipeline, factory = setup
+    factory.revise = True
+    state = run_literature(setup)          # generates H001, H002, H003
+    pipeline.config = pipeline.config.model_copy(update={"max_revision_rounds": 2})
+    final = HypothesisPipeline(pipeline).run(state, store=store, source_root=ROOT,
+                                             artifact_root=pipeline.artifact_root)
+    live = [h.id for h in final.hypotheses if h.id.startswith("H") and not h.id.startswith("HD")]
+    retired = [h.id for h in final.hypotheses if h.id.startswith("HD")]
+    # Retired versions keep their number with the HD prefix; successors take the next
+    # compact live numbers, so H### reads as one consecutive line of current candidates.
+    assert retired, "expected at least one retired revision"
+    assert all(re.fullmatch(r"HD\d+", h) for h in retired)
+    assert sorted(live) == [f"H{i:03d}" for i in range(1, len(live) + 1)]
+    # Every successor cites its retired parent, and history IDs never re-enter review.
+    for hypothesis in final.hypotheses:
+        if hypothesis.parent_hypotheses:
+            assert all(p.startswith("HD") or p.startswith("H") for p in hypothesis.parent_hypotheses)
+    ancestors = {p for h in final.hypotheses for p in h.parent_hypotheses}
+    assert all(h.id in ancestors or h.id.startswith("HD") for h in final.hypotheses
+               if h.id.startswith("HD"))
+    # Referential integrity still validates after the renames.
+    from scientist.state import ScientificState as _S
+    _S.model_validate_json(final.model_dump_json())
 
 
 def test_ready_verdict_with_mandatory_changes_is_rejected(setup):

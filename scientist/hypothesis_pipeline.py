@@ -4,7 +4,9 @@ from pathlib import Path
 from uuid import uuid4
 
 from .agents.hypothesis_review import HypothesisReviewAgent, HypothesisRevisionAgent
-from .agents.llm_hypothesis import DraftBatch, LLMHypothesisAgent, allocate_ids, hypothesis_context, normalized
+from .agents.llm_hypothesis import (LIVE_ID, DraftBatch, LLMHypothesisAgent, _live_number,
+                                    _next_history_id, _rename_hypothesis, allocate_ids,
+                                    hypothesis_context, normalized)
 from .agents.structured import StructuredAgent
 from .hypothesis_generation import hypothesis_report
 from .literature_pipeline import LiteraturePipeline, research_literature
@@ -144,6 +146,21 @@ class HypothesisPipeline:
         new = tuple(Hypothesis(id=hid, **d.model_dump(), status="proposed", confidence=0.5)
                     for hid, d in zip(ids, batch.hypotheses))
         replacements = {h.parent_hypotheses[0]: h.id for h in new}
+        # Each revised family passes its H### slot to its successor; the superseded
+        # version retires to a globally numbered HD### record in retirement order.
+        retirement = {}
+        for retired, successor in list(replacements.items()):
+            history_id = _next_history_id(state)
+            retirement[retired] = history_id
+            state = _rename_hypothesis(state, retired, history_id)
+            slot_id = f"H{_live_number(retired):03d}"
+            state = _rename_hypothesis(state, successor, slot_id)
+            replacements[retired] = slot_id
+        # Successors cite their retired parents; live numbers stay free for new candidates.
+        new = tuple(h.model_copy(update={"parent_hypotheses": tuple(retirement.get(p, p)
+                                                                    for p in h.parent_hypotheses),
+                                         "id": replacements[h.parent_hypotheses[0]]})
+                    for h in new)
         return state.revised(hypotheses=state.hypotheses + new), replacements
 
     def run(self, state, *, store, source_root, artifact_root, generate=True):
@@ -153,7 +170,8 @@ class HypothesisPipeline:
             state, targets = self.generate(state)
         else:
             ancestors = {p for h in state.hypotheses for p in h.parent_hypotheses}
-            targets = tuple(h.id for h in state.hypotheses if h.id not in ancestors and h.status == "proposed")
+            targets = tuple(h.id for h in state.hypotheses if LIVE_ID.fullmatch(h.id)
+                            and h.id not in ancestors and h.status == "proposed")
             if not targets or len(targets) > 6 or state.literature is None:
                 raise ValueError("Review requires 1-6 current untested hypotheses and completed literature")
         supplements, retrieval_failures = 0, []

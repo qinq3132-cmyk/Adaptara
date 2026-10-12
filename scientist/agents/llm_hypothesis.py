@@ -57,20 +57,91 @@ def normalized(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().casefold()
 
 
+# Hypothesis identifiers: live candidates keep a compact consecutive H### sequence.
+# A revision retires the superseded version to read-only history as HD### (numbered
+# globally in retirement order) and passes the family's H### slot to its successor,
+# so live candidates always read H001..H### without gaps.
+LIVE_ID = re.compile(r"H(\d+)$")
+HISTORY_ID = re.compile(r"HD(\d+)$")
+
+
+def _live_number(hid: str) -> int | None:
+    match = LIVE_ID.fullmatch(hid) or HISTORY_ID.fullmatch(hid)
+    return int(match.group(1)) if match else None
+
+
+def _next_history_id(state: ScientificState) -> str:
+    used = {int(m.group(1)) for h in state.hypotheses if (m := HISTORY_ID.fullmatch(h.id))}
+    number = 1
+    while number in used:
+        number += 1
+    return f"HD{number:03d}"
+
+
+def _rename_hypothesis(state: ScientificState, old_id: str, new_id: str) -> ScientificState:
+    """Rename one hypothesis and every recorded reference to it.
+
+    All links (parents, review batches, evidence direction) are rebuilt so the
+    state keeps passing referential integrity before the caller commits it.
+    """
+    def fix_hypothesis(h):
+        fields = h.model_dump()
+        fields["id"] = new_id if h.id == old_id else fields["id"]
+        fields["parent_hypotheses"] = tuple(new_id if p == old_id else p for p in h.parent_hypotheses)
+        return Hypothesis.model_validate(fields)
+
+    def fix_record(record):
+        batch = record.batch.model_dump(mode="json")
+        for item in batch["reviews"]:
+            if item["hypothesis_id"] == old_id:
+                item["hypothesis_id"] = new_id
+            item["closest_paper_ids"] = list(item["closest_paper_ids"])
+        batch["ranking"] = [new_id if r == old_id else r for r in batch["ranking"]]
+        for comparison in batch["comparisons"]:
+            comparison["predictions"] = {new_id if k == old_id else k: v
+                                         for k, v in comparison["predictions"].items()}
+        updated = record.model_copy(update={"batch": type(record.batch).model_validate(batch)})
+        return updated
+
+    def fix_evidence(e):
+        if old_id in e.supports or old_id in e.contradicts:
+            return e.model_copy(update={
+                "supports": tuple(new_id if x == old_id else x for x in e.supports),
+                "contradicts": tuple(new_id if x == old_id else x for x in e.contradicts)})
+        return e
+
+    def fix_open_question(q):
+        if old_id in q.source_ids:
+            return q.model_copy(update={"source_ids": tuple(new_id if x == old_id else x
+                                                           for x in q.source_ids)})
+        return q
+
+    def fix_decision(d):
+        if old_id in d.related_ids:
+            return d.model_copy(update={"related_ids": tuple(new_id if x == old_id else x
+                                                             for x in d.related_ids)})
+        return d
+
+    return state.revised(
+        hypotheses=tuple(fix_hypothesis(h) for h in state.hypotheses),
+        evidence=tuple(fix_evidence(e) for e in state.evidence),
+        open_questions=tuple(fix_open_question(q) for q in state.open_questions),
+        decisions=tuple(fix_decision(d) for d in state.decisions),
+        hypothesis_reviews=tuple(fix_record(r) for r in state.hypothesis_reviews))
+
+
 def allocate_ids(state: ScientificState, count: int) -> tuple[str, ...]:
-    data = state.model_dump()
+    """Next compact live H### numbers, skipping numbers already used live or as history."""
     existing = {state.question.id}
-    for value in data.values():
+    for value in state.model_dump().values():
         if isinstance(value, (list, tuple)):
             existing.update(item["id"] for item in value if isinstance(item, dict) and "id" in item)
-    maximum = max((int(h.id[1:]) for h in state.hypotheses if re.fullmatch(r"H\d+", h.id)), default=0)
-    ids = []
-    candidate = maximum + 1
+    used = {_live_number(h.id) for h in state.hypotheses}
+    ids, candidate = [], 1
     while len(ids) < count:
-        identifier = f"H{candidate:03d}"
+        if candidate not in used and f"H{candidate:03d}" not in existing:
+            ids.append(f"H{candidate:03d}")
         candidate += 1
-        if identifier not in existing:
-            ids.append(identifier)
     return tuple(ids)
 
 
