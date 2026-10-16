@@ -122,9 +122,29 @@ def _rename_hypothesis(state: ScientificState, old_id: str, new_id: str) -> Scie
                                                              for x in d.related_ids)})
         return d
 
+    def fix_experiment(x):
+        if old_id in x.hypotheses_tested:
+            return x.model_copy(update={
+                "hypotheses_tested": tuple(new_id if t == old_id else t for t in x.hypotheses_tested),
+                "expected_outcomes": {new_id if k == old_id else k: v
+                                      for k, v in x.expected_outcomes.items()},
+                "falsification_logic": {new_id if k == old_id else k: v
+                                        for k, v in x.falsification_logic.items()}})
+        return x
+
+    def fix_theory_update(u):
+        changed = tuple(u.changes)
+        if any(c.hypothesis_id == old_id for c in changed):
+            changed = tuple(c.model_copy(update={"hypothesis_id": new_id})
+                            if c.hypothesis_id == old_id else c for c in changed)
+            return u.model_copy(update={"changes": changed})
+        return u
+
     return state.revised(
         hypotheses=tuple(fix_hypothesis(h) for h in state.hypotheses),
         evidence=tuple(fix_evidence(e) for e in state.evidence),
+        experiments=tuple(fix_experiment(x) for x in state.experiments),
+        theory_updates=tuple(fix_theory_update(u) for u in state.theory_updates),
         open_questions=tuple(fix_open_question(q) for q in state.open_questions),
         decisions=tuple(fix_decision(d) for d in state.decisions),
         hypothesis_reviews=tuple(fix_record(r) for r in state.hypothesis_reviews))

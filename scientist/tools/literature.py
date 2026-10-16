@@ -118,6 +118,20 @@ def candidate_id(title: str) -> str:
     return "P_" + hashlib.sha256(normalize(title).casefold().encode()).hexdigest()[:16]
 
 
+_BOILERPLATE = ("frontiers events is a rapidly growing calendar management",
+                "this article is part of the research topic")
+
+
+def clean_abstract(text: str) -> str:
+    """Drop publisher boilerplate masquerading as an abstract, so screening's
+    needs_metadata rule (only for candidates WITHOUT an abstract) stays
+    semantically meaningful."""
+    low = normalize(text or "").casefold()
+    if any(low.startswith(b) or b in low[:120] for b in _BOILERPLATE):
+        return ""
+    return text
+
+
 def normalized_doi(value):
     return re.sub(r"^https?://(?:dx\.)?doi\.org/", "", value or "", flags=re.IGNORECASE).strip().casefold()
 
@@ -187,9 +201,9 @@ class ArticleHTML(HTMLParser):
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
         in_article = any(a for _, a, _, _ in self.stack)
-        article = tag in {"article", "main"} or "ltx_document" in attrs.get("class", "").split()
+        article = tag in {"article", "main"} or "ltx_document" in (attrs.get("class") or "").split()
         excluded = tag in {"script", "style", "nav", "footer", "button"} or any(e for _, _, e, _ in self.stack)
-        abstract = "abstract" in (attrs.get("id", "") + " " + attrs.get("class", "")).lower() or any(a for _, _, _, a in self.stack)
+        abstract = "abstract" in ((attrs.get("id") or "") + " " + (attrs.get("class") or "")).lower() or any(a for _, _, _, a in self.stack)
         if article:
             if not self.article_seen:
                 self.blocks, self.parts, self.body_blocks = [], [], []
@@ -329,7 +343,7 @@ class LiteratureTools:
                     pmid = (ids.get("pmid") or "").rstrip("/").rsplit("/", 1)[-1] or None
                     pmcid = (ids.get("pmcid") or "").rstrip("/").rsplit("/", 1)[-1] or None
                     result.append(PaperCandidate(id=candidate_id(title), title=title,
-                        abstract=" ".join(positions[n] for n in sorted(positions)),
+                        abstract=clean_abstract(" ".join(positions[n] for n in sorted(positions))),
                         authors=tuple(a["author"]["display_name"] for a in p.get("authorships", [])),
                         year=p.get("publication_year"), doi=doi, pmid=pmid, pmcid=pmcid,
                         source_uri="https://doi.org/" + doi if doi else p["id"],
@@ -366,7 +380,7 @@ class LiteratureTools:
                              if v.get("content-type") == "application/pdf" and v.get("URL")]
                     doi = p["DOI"]
                     result.append(PaperCandidate(id=candidate_id(title), title=title,
-                        abstract=" ".join(t for _, t in abstract.blocks),
+                        abstract=clean_abstract(" ".join(t for _, t in abstract.blocks)),
                         authors=tuple(normalize(" ".join([a.get("given", ""), a.get("family", "")]))
                                       for a in p.get("author", [])),
                         year=dates[0][0] if dates and dates[0] else None, doi=doi,
@@ -405,7 +419,7 @@ class LiteratureTools:
             try:
                 next_offset = payload.get("next")
                 self.next_page = {"offset": next_offset, "exhausted": type(next_offset) is not int or next_offset <= offset}
-                return [PaperCandidate(id=candidate_id(p["title"]), title=p["title"], abstract=p.get("abstract") or "",
+                return [PaperCandidate(id=candidate_id(p["title"]), title=p["title"], abstract=clean_abstract(p.get("abstract") or ""),
                             authors=tuple(a["name"] for a in p.get("authors", [])), year=p.get("year"),
                             doi=(p.get("externalIds") or {}).get("DOI"), arxiv_id=(p.get("externalIds") or {}).get("ArXiv"),
                             pmid=(p.get("externalIds") or {}).get("PubMed"), pmcid=(p.get("externalIds") or {}).get("PubMedCentral"),
@@ -476,7 +490,7 @@ class LiteratureTools:
                 identifier = p["id"]
                 names = (p.get("authorList") or {}).get("author", [])
                 result.append(PaperCandidate(id=candidate_id(title), title=title,
-                    abstract=" ".join(t for _, t in parser.blocks),
+                    abstract=clean_abstract(" ".join(t for _, t in parser.blocks)),
                     authors=tuple(a.get("fullName") or "" for a in names),
                     year=int(p["pubYear"]) if p.get("pubYear") else None, doi=doi,
                     pmid=identifier if source == "MED" else None, pmcid=pmcid,
@@ -540,7 +554,7 @@ class LiteratureTools:
             return PaperCandidate(id=paper.id, title=paper.title, doi=record.get("doi"),
                 pmid=(identifiers.get("pmid") or "").rstrip("/").rsplit("/", 1)[-1] or None,
                 pmcid=(identifiers.get("pmcid") or "").rstrip("/").rsplit("/", 1)[-1] or None,
-                abstract=" ".join(positions[i] for i in sorted(positions)), source_uri=paper.source_uri,
+                abstract=clean_abstract(" ".join(positions[i] for i in sorted(positions))), source_uri=paper.source_uri,
                 fulltext_uri=urls[0] if urls else None, fulltext_uris=urls,
                 providers=(provider,), query_texts=paper.query_texts)
         data, _ = self.http.get("https://api.crossref.org/works/" + quote(normalized_doi(paper.doi), safe=""))
@@ -551,7 +565,7 @@ class LiteratureTools:
         links = tuple(dict.fromkeys(v['URL'] for v in record.get('link', [])
                                     if v.get('content-type') == 'application/pdf' and v.get('URL')))
         return PaperCandidate(id=paper.id, title=paper.title, doi=record["DOI"],
-            abstract=" ".join(t for _, t in parser.blocks), source_uri=paper.source_uri,
+            abstract=clean_abstract(" ".join(t for _, t in parser.blocks)), source_uri=paper.source_uri,
             fulltext_uri=links[0] if links else None, fulltext_uris=links,
             providers=(provider,), query_texts=paper.query_texts)
 

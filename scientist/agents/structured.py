@@ -1,5 +1,7 @@
 """Validated role calls with persistent successful responses and bounded retries."""
 import json
+import os
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -54,20 +56,27 @@ class StructuredAgent:
         trace = []
         for index in range(self.settings.validation_retries + 1):
             prompt = json.dumps(request, ensure_ascii=False, sort_keys=True)
-            for transport_attempt in range(2):
+            # Transient provider/gateway failures dominate real runs; retry with
+            # capped exponential backoff instead of a single immediate retry.
+            transport_retries = max(1, int(os.environ.get("SCIENTIST_TRANSPORT_RETRIES", "5")))
+            backoff = float(os.environ.get("SCIENTIST_TRANSPORT_BACKOFF_SECONDS", "5"))
+            for transport_attempt in range(transport_retries + 1):
                 try:
                     response = backend.complete(instructions=instructions, prompt=prompt)
                     break
                 except (RuntimeError, OSError) as error:
                     code = getattr(error, "code", None)
                     transient = isinstance(error, OSError) or code in {"timeout", "runtime_or_provider_failed"}
-                    retry = transient and transport_attempt == 0
+                    retry = transient and transport_attempt < transport_retries
                     (slot / ("transport_failed_" + uuid4().hex + ".json")).write_bytes(
                         json_bytes({"role": self.role, "error_type": type(error).__name__, "error_code": code,
                                     "transport_attempt": transport_attempt + 1, "retry": retry, "identity": identity}))
                     if not retry:
                         raise
-                    self.emit(f"{self.role}: transient invocation failure; retrying once ({self.settings.model})")
+                    delay = min(backoff * (2 ** transport_attempt), 60)
+                    self.emit(f"{self.role}: transient invocation failure; retry {transport_attempt + 1}/{transport_retries} "
+                              f"in {delay:.0f}s ({self.settings.model})")
+                    time.sleep(delay)
             entry = {"role": self.role, "attempt": index + 1, "instructions": instructions, "prompt": prompt,
                      "response_text": response.text, "runtime": response.metadata, "accepted": False}
             trace.append(entry)

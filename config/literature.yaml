@@ -7,7 +7,12 @@ max_pages_per_query: 3
 max_candidates: 120
 max_candidates_per_round: 40
 max_selected_papers: 20
-reading_concurrency: 8
+# 2026-10-14: measured gateway concurrency limit for this API key (429
+# gateway_concurrency_limit at >=4 parallel large reading requests). Large
+# 50KB readings take 150-280s each; 8-way bursts triggered rate-limit clusters
+# and pushed single requests past the 300s codex timeout. 2 keeps total time
+# similar (bounded by slowest request) without tripping the gateway limiter.
+reading_concurrency: 2
 min_candidates: 30
 min_selected_papers: 12
 max_search_rounds: 4

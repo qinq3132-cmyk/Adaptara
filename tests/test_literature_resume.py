@@ -206,11 +206,13 @@ def test_cli_rejects_resume_in_unrelated_modes(mode):
         main([mode, '--literature-discovery', 'discovery.json'])
 
 
-@pytest.mark.parametrize('code,failures,expected_calls,success', [
-    ('timeout', 1, 2, True), ('timeout', 2, 2, False), ('provider_auth_failed', 1, 1, False),
+@pytest.mark.parametrize('code,failures,expected_calls,success,transport_retries', [
+    ('timeout', 1, 2, True, '1'), ('timeout', 5, 6, True, '5'),
+    ('timeout', 6, 6, False, '5'), ('provider_auth_failed', 1, 1, False, '5'),
 ])
-def test_transient_invocation_retry_is_bounded_and_preserves_screening_cache(tmp_path, code, failures, expected_calls, success):
+def test_transient_invocation_retry_is_bounded_and_preserves_screening_cache(tmp_path, code, failures, expected_calls, success, transport_retries, monkeypatch):
     from scientist.backends.codex import CodexError
+    monkeypatch.setenv('SCIENTIST_TRANSPORT_BACKOFF_SECONDS', '0')  # no real sleeping
     pipeline, factory, state, path = prepared(tmp_path)
     calls = []
     def flaky(settings, *, role):
